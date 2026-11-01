@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""hypertop source: Android devices, phones and TVs alike, through adb.
+
+Every device adb can see appears by itself. ~/.config/hypertop/adb.json is optional,
+for when adb lives on another machine, or a device needs a name or a way to wake it:
+
+    {
+      "adb": "ssh -T -o BatchMode=yes otherbox .local/bin/adb",
+      "devices": {
+        "192.168.1.20:5555": {"name": "Living room TV", "group": "screens", "kind": "TV",
+                              "wake": ["wakeonlan", "aa:bb:cc:dd:ee:ff"]}
+      }
+    }
+
+Devices named there are connected to if adb doesn't have them, and stay listed as off
+when they don't answer. Peeking only reads. Pressing a key on a device is an action.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+CONFIG = os.path.expanduser("~/.config/hypertop/adb.json")
+EVERY = 60
+# One line each, in this order, so one shell call answers everything.
+QUESTIONS = (
+    "getprop ro.product.model; getprop ro.build.version.release; "
+    "dumpsys power | grep -m1 mWakefulness=; dumpsys battery | grep -E '^ *(level|temperature|AC powered|USB powered):'; "
+    "dumpsys window | grep -m1 mCurrentFocus"
+)
+
+
+def load_config(path=CONFIG):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except OSError:
+        return {}
+    except ValueError as exc:
+        sys.exit(f"{path}: {exc}")
+
+
+class Adb:
+    def __init__(self, prefix):
+        self.prefix = shlex.split(prefix)
+        self.remote = self.prefix[0] == "ssh"
+
+    def argv(self, *args):
+        return self.prefix + list(args)
+
+    def shell_argv(self, serial, command):
+        # Through ssh a remote shell reads the command once more before adb does.
+        return self.argv("-s", serial, "shell", shlex.quote(command) if self.remote else command)
+
+    def terminal_argv(self, serial):
+        """An interactive shell; through ssh, that needs a terminal at the far end."""
+        prefix = [{"-T": "-t"}.get(word, word) for word in self.prefix]
+        return prefix + ["-s", serial, "shell"]
+
+    def run(self, *args, timeout=20):
+        return subprocess.run(self.argv(*args), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, errors="replace")
+
+    def listed(self):
+        """{serial: state} from `adb devices`."""
+        r = self.run("devices")
+        if r.returncode != 0:
+            raise OSError((r.stderr.strip().splitlines() or ["adb failed"])[-1])
+        return parse_devices(r.stdout)
+
+
+def parse_devices(text):
+    found = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] in ("device", "offline", "unauthorized"):
+            found[parts[0]] = parts[1]
+    return found
+
+
+def parse_answers(text):
+    """What QUESTIONS printed, as protocol fields."""
+    lines = [line.strip() for line in text.splitlines()]
+    fields = {"model": lines[0] if lines else "", "android": lines[1] if len(lines) > 1 else ""}
+    joined = "\n".join(lines)
+    wake = re.search(r"mWakefulness=(\w+)", joined)
+    fields["wakefulness"] = wake.group(1) if wake else None
+    level = re.search(r"^level: (\d+)", joined, re.M)
+    fields["battery"] = int(level.group(1)) if level else None
+    temperature = re.search(r"^temperature: (\d+)", joined, re.M)
+    fields["temp"] = int(temperature.group(1)) / 10 if temperature else None
+    fields["charging"] = bool(re.search(r"^(AC|USB) powered: true", joined, re.M))
+    focus = re.search(r"mCurrentFocus=Window\{\S+ \S+ ([^/\s}]+)", joined)
+    fields["app"] = focus.group(1) if focus else None
+    return fields
+
+
+def describe(adb, serial, settings):
+    """The device, from asking it."""
+    keys = {"up": "input keyevent KEYCODE_WAKEUP", "sleep": "input keyevent KEYCODE_SLEEP", "home": "input keyevent KEYCODE_HOME"}
+    device = base(serial, settings)
+    r = subprocess.run(adb.shell_argv(serial, QUESTIONS), capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL, errors="replace")
+    if r.returncode != 0:
+        device.update(state="unknown", note=(r.stderr.strip().splitlines() or ["no answer"])[-1])
+        return device
+    a = parse_answers(r.stdout)
+    awake = a["wakefulness"] == "Awake"
+    metrics = {}
+    if a["temp"] is not None and a["temp"] > 0:
+        metrics["temp"] = a["temp"]
+    if a["battery"] is not None and not settings.get("no_battery") and settings.get("kind") != "TV":
+        metrics["battery %"] = a["battery"]
+    note = [f"Android {a['android']}"] if a["android"] else []
+    if a["app"]:
+        note.append(a["app"])
+    if "battery %" in metrics:
+        note.append(f"battery {a['battery']}%{' charging' if a['charging'] else ''}")
+    device.update(
+        state="up" if awake else "idle",
+        kind=settings.get("kind") or "Android",
+        note=("" if awake else "asleep  ") + "  ".join(note),
+        metrics=metrics,
+        info={"serial": serial, "model": a["model"]},
+        peeks=[
+            {"label": "processes", "run": adb.shell_argv(serial, "top -b -n 1 -m 20 | cut -c1-100"), "every": 5},
+            {"label": "storage", "run": adb.shell_argv(serial, "df -h /data /sdcard 2>/dev/null"), "every": 30},
+        ],
+        actions=actions(adb, serial, settings) + [
+            {"id": "press-wake", "label": "Screen on", "run": adb.shell_argv(serial, keys["up"])},
+            {"id": "press-sleep", "label": "Screen off", "run": adb.shell_argv(serial, keys["sleep"]), "confirm": True},
+            {"id": "press-home", "label": "Home button", "run": adb.shell_argv(serial, keys["home"])},
+        ],
+    )
+    return device
+
+
+def base(serial, settings):
+    return {
+        "id": serial,
+        "name": settings.get("name") or serial,
+        "group": settings.get("group") or "android",
+        "kind": settings.get("kind") or "Android",
+    }
+
+
+def actions(adb, serial, settings):
+    found = [
+        {"id": "shell", "label": "Open a shell", "run": adb.terminal_argv(serial), "tty": True},
+        {"id": "run", "label": "Run a command", "run": adb.argv("-s", serial, "shell", "{input}"), "input": "Command"},
+    ]
+    if settings.get("wake"):
+        found.insert(0, wake_action(settings))
+    return found
+
+
+def wake_action(settings):
+    return {"id": "wake", "label": "Wake", "run": [os.path.expanduser(a) for a in settings["wake"]]}
+
+
+def main():
+    print(json.dumps({"every": EVERY}), flush=True)
+    config = load_config()
+    prefix = config.get("adb") or shutil.which("adb")
+    if not prefix:
+        return  # no adb here: no devices, and nothing wrong
+    adb = Adb(prefix)
+    named = config.get("devices", {})
+    listed = adb.listed()
+    for serial in named:
+        if listed.get(serial) != "device" and ":" in serial:
+            adb.run("connect", serial, timeout=10)
+    listed = adb.listed()
+    for serial in sorted(set(listed) | set(named)):
+        settings = named.get(serial, {})
+        state = listed.get(serial)
+        if state == "device":
+            device = describe(adb, serial, settings)
+        else:
+            device = base(serial, settings)
+            device.update(
+                state="down",
+                metrics={},
+                peeks=[],
+                note="needs authorising on the device" if state == "unauthorized" else "",
+                info={"serial": serial},
+                actions=[wake_action(settings)] if settings.get("wake") else [],
+            )
+        print(json.dumps(device, ensure_ascii=False), flush=True)
+
+
+if __name__ == "__main__":
+    main()

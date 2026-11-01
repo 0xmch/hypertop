@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""hypertop source: what else is on the local network.
+
+It pings every address on this machine's subnet and lists what answers, leaving out
+machines the ssh source already covers. It only looks at a private subnet of at most
+254 addresses, so it never sweeps anything big or anything public. It sends one small
+packet per address, a few milliseconds apart, through one socket: no processes, no
+sudo, nothing installed anywhere.
+
+Names come from ~/.config/hypertop/lan-names if you've given one, then multicast DNS,
+then reverse DNS, and otherwise the address. A line in that file is an address or a MAC
+address and a name, and the name "-" leaves the device out:
+
+    192.168.1.1   Router
+    192.168.1.50  -
+
+What has been seen is remembered in ~/.cache/hypertop/lan.json for a day, so something
+that stops answering shows as off rather than vanishing.
+"""
+import ipaddress
+import json
+import os
+import re
+import select
+import socket
+import struct
+import subprocess
+import threading
+import time
+
+NAMES = os.path.expanduser("~/.config/hypertop/lan-names")
+CACHE = os.path.expanduser("~/.cache/hypertop/lan.json")
+SSH_CONFIG = os.path.expanduser("~/.ssh/config")
+EVERY = 120
+FORGET_AFTER = 24 * 3600
+SPACING = 0.004         # between pings: about a second for a whole /24
+WAIT = 1.5              # for the last replies
+MAX_HOSTS = 254
+MDNS_GROUP = ("224.0.0.251", 5353)
+TYPE_PTR = 12
+
+
+def own_network():
+    """This machine's address and subnet, on the interface with the default route."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))  # picks the outgoing address, sends nothing
+        address = probe.getsockname()[0]
+    finally:
+        probe.close()
+    return address, parse_prefix(address, interface_listing())
+
+
+def interface_listing():
+    for argv in (["ip", "-o", "-f", "inet", "addr", "show"], ["ifconfig"]):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout
+        except OSError:
+            continue
+    return ""
+
+
+def parse_prefix(address, listing):
+    """The prefix length of `address` in `ip addr` or `ifconfig` output."""
+    escaped = re.escape(address)
+    found = re.search(escaped + r"/(\d+)", listing)
+    if found:
+        return int(found.group(1))
+    found = re.search(r"inet (?:addr:)?" + escaped + r"\s+netmask (0x[0-9a-f]+|[\d.]+)", listing)
+    if not found:
+        return None
+    mask = found.group(1)
+    bits = int(mask, 16) if mask.startswith("0x") else int(ipaddress.ip_address(mask))
+    return bin(bits).count("1")
+
+
+def hosts_to_scan(address, prefix):
+    """The addresses to ping, or nothing if this is not a small private network."""
+    if prefix is None:
+        return []
+    network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
+    if not network.is_private or network.num_addresses - 2 > MAX_HOSTS or network.prefixlen > 30:
+        return []
+    return [str(h) for h in network.hosts()]
+
+
+def checksum(data):
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data[:len(data) // 2 * 2]))
+    total = (total >> 16) + (total & 0xffff)
+    total += total >> 16
+    return ~total & 0xffff
+
+
+def echo_request(sequence):
+    header = struct.pack("!BBHHH", 8, 0, 0, 0x4854, sequence)
+    return struct.pack("!BBHHH", 8, 0, checksum(header), 0x4854, sequence)
+
+
+def sweep(hosts):
+    """Which hosts answer, with how many ms they took."""
+    wanted = set(hosts)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    sock.setblocking(False)
+    sent, seen = {}, {}
+
+    def collect(until):
+        while True:
+            left = until - time.monotonic()
+            if left <= 0:
+                return
+            ready, _, _ = select.select([sock], [], [], left)
+            if not ready:
+                return
+            try:
+                _, sender = sock.recvfrom(256)
+            except OSError:
+                continue
+            if sender[0] in wanted and sender[0] not in seen and sender[0] in sent:
+                seen[sender[0]] = (time.monotonic() - sent[sender[0]]) * 1000
+
+    for number, host in enumerate(hosts):
+        sent[host] = time.monotonic()
+        try:
+            sock.sendto(echo_request(number), (host, 0))
+        except OSError:
+            pass  # some addresses refuse at once; that is an answer too
+        collect(time.monotonic() + SPACING)
+    collect(time.monotonic() + WAIT)
+    sock.close()
+    return seen
+
+
+def sweep_with_ping(hosts):
+    """For systems that don't let an ordinary user send ICMP through a socket."""
+    seen = {}
+    lock = threading.Lock()
+    pending = list(hosts)
+
+    def worker():
+        while True:
+            with lock:
+                if not pending:
+                    return
+                host = pending.pop()
+            r = subprocess.run(["ping", "-c", "1", "-W", "1", host], capture_output=True, text=True)
+            if r.returncode == 0:
+                found = re.search(r"time[=<]([\d.]+)", r.stdout)
+                with lock:
+                    seen[host] = float(found.group(1)) if found else 0.0
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return seen
+
+
+def read_name(packet, at):
+    """A DNS name from whatever the network sent: checked, with limited pointers."""
+    labels, resume = [], None
+    for _ in range(32):
+        if at >= len(packet):
+            return None, None
+        length = packet[at]
+        if length == 0:
+            return ".".join(labels), (resume if resume is not None else at + 1)
+        if length & 0xc0 == 0xc0:
+            if at + 1 >= len(packet):
+                return None, None
+            if resume is None:
+                resume = at + 2
+            at = ((length & 0x3f) << 8) | packet[at + 1]
+        elif length <= 63 and at + 1 + length <= len(packet):
+            labels.append(packet[at + 1:at + 1 + length].decode("utf-8", "replace"))
+            at += 1 + length
+        else:
+            return None, None
+    return None, None
+
+
+def ptr_records(packet):
+    """{reverse name: target} for every PTR record in a DNS message."""
+    records = {}
+    if len(packet) < 12:
+        return records
+    questions, answers, authority, additional = struct.unpack("!4H", packet[4:12])
+    at = 12
+    for _ in range(questions):
+        _, at = read_name(packet, at)
+        if at is None:
+            return records
+        at += 4
+    for _ in range(answers + authority + additional):
+        name, at = read_name(packet, at)
+        if at is None or at + 10 > len(packet):
+            return records
+        kind, _, _, size = struct.unpack("!HHIH", packet[at:at + 10])
+        at += 10
+        if kind == TYPE_PTR:
+            target, _ = read_name(packet, at)
+            if target:
+                records[name.lower()] = target
+        at += size
+    return records
+
+
+def reverse_name(address):
+    return ".".join(reversed(address.split("."))) + ".in-addr.arpa"
+
+
+def mdns_question(address):
+    out = struct.pack("!6H", 0, 0, 1, 0, 0, 0)
+    for label in reverse_name(address).split("."):
+        out += bytes([len(label)]) + label.encode()
+    return out + b"\0" + struct.pack("!HH", TYPE_PTR, 0x8001)
+
+
+def mdns_names(addresses):
+    """Ask the local network what these addresses are called."""
+    names = {}
+    wanted = {reverse_name(a): a for a in addresses}
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        sock.setblocking(False)
+        for address in addresses:
+            sock.sendto(mdns_question(address), MDNS_GROUP)
+        until = time.monotonic() + 1.0
+        while time.monotonic() < until:
+            ready, _, _ = select.select([sock], [], [], until - time.monotonic())
+            if not ready:
+                break
+            packet, _ = sock.recvfrom(4096)
+            for name, target in ptr_records(packet).items():
+                if name in wanted:
+                    names[wanted[name]] = target
+        sock.close()
+    except OSError:
+        pass
+    return names
+
+
+def reverse_dns(addresses):
+    names = {}
+
+    def ask(address):
+        try:
+            names[address] = socket.gethostbyaddr(address)[0]
+        except OSError:
+            pass
+
+    threads = [threading.Thread(target=ask, args=(a,), daemon=True) for a in addresses]
+    for thread in threads:
+        thread.start()
+    until = time.monotonic() + 1.5
+    for thread in threads:
+        thread.join(max(0, until - time.monotonic()))
+    return dict(names)
+
+
+def short_name(name):
+    return name.split(".")[0] or name
+
+
+def read_names(path=NAMES):
+    """{address or lowercase MAC: name} from the names file."""
+    names = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                parts = line.split("#")[0].split(None, 1)
+                if len(parts) == 2:
+                    names[parts[0].lower()] = parts[1].strip()
+    except OSError:
+        pass
+    return names
+
+
+def neighbours():
+    """{address: MAC} from the system's table, where it will tell us."""
+    try:
+        listing = subprocess.run(["arp", "-an"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return {a: normal_mac(m) for a, m in re.findall(r"\(([\d.]+)\) at ([0-9a-fA-F:]+)", listing)}
+
+
+def normal_mac(text):
+    return ":".join(part.zfill(2) for part in text.lower().split(":"))
+
+
+def ssh_covered():
+    """The addresses of the machines the ssh source lists."""
+    try:
+        with open(SSH_CONFIG, errors="replace") as fh:
+            aliases = [line.split()[1] for line in fh if re.match(r"\s*host\s+\S", line, re.I) and not set(line) & set("*?!")]
+    except OSError:
+        return set()
+    covered = set()
+    lock = threading.Lock()
+
+    def resolve(alias):
+        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        host = next((line.split()[1] for line in r.stdout.splitlines() if line.startswith("hostname ")), None)
+        try:
+            found = socket.gethostbyname(host) if host else None
+        except OSError:
+            found = None
+        if found:
+            with lock:
+                covered.add(found)
+
+    threads = [threading.Thread(target=resolve, args=(a,), daemon=True) for a in aliases]
+    for thread in threads:
+        thread.start()
+    until = time.monotonic() + 3
+    for thread in threads:
+        thread.join(max(0, until - time.monotonic()))
+    return set(covered)
+
+
+def load_seen():
+    try:
+        with open(CACHE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_seen(seen):
+    os.makedirs(os.path.dirname(CACHE), mode=0o700, exist_ok=True)
+    partial = CACHE + ".tmp"
+    with open(partial, "w") as fh:
+        json.dump(seen, fh)
+    os.replace(partial, CACHE)
+
+
+def ago(seconds):
+    if seconds < 5400:
+        return f"{max(1, int(seconds / 60))} min ago"
+    return f"{int(seconds / 3600)} h ago"
+
+
+def main():
+    print(json.dumps({"every": EVERY}), flush=True)
+    address, prefix = own_network()
+    hosts = hosts_to_scan(address, prefix)
+    if not hosts:
+        return
+    try:
+        answered = sweep(hosts)
+    except OSError:
+        answered = sweep_with_ping(hosts)
+
+    now = time.time()
+    seen = {a: e for a, e in load_seen().items() if now - e.get("at", 0) < FORGET_AFTER and a in hosts}
+    macs = neighbours()
+    found = list(answered)
+    discovered = {a: short_name(n) for a, n in reverse_dns(found).items()}
+    discovered.update({a: short_name(n) for a, n in mdns_names(found).items()})
+    for host, ms in answered.items():
+        entry = seen.setdefault(host, {})
+        entry["at"] = now
+        if host in discovered:
+            entry["name"] = discovered[host]
+        if host in macs:
+            entry["mac"] = macs[host]
+    save_seen(seen)
+
+    given = read_names()
+    covered = ssh_covered() | {address}
+    for host, entry in sorted(seen.items(), key=lambda item: int(item[0].split(".")[-1])):
+        mac = entry.get("mac")
+        name = given.get(host) or (given.get(mac) if mac else None) or entry.get("name") or host
+        if host in covered or name == "-":
+            continue
+        up = host in answered
+        info = {"address": host}
+        if mac:
+            info["mac"] = mac
+        if name != entry.get("name") and entry.get("name"):
+            info["network name"] = entry["name"]
+        print(json.dumps({
+            "id": host,
+            "name": name,
+            "group": "network",
+            "kind": "device",
+            "state": "up" if up else "down",
+            "note": host if up else f"{host}, last seen {ago(now - entry['at'])}",
+            "metrics": {"ping ms": round(answered[host], 1)} if up else {},
+            "info": info,
+            "peeks": [{"label": "ping", "run": ["ping", "-c", "3", host], "every": 10}],
+        }, ensure_ascii=False), flush=True)
+
+
+if __name__ == "__main__":
+    main()

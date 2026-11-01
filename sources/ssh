@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""hypertop source: every host in ~/.ssh/config.
+
+Nothing has to be installed on the hosts. Each one gets a small sampler that runs
+for as long as hypertop does, over one ssh connection, using what the machine
+already has: /proc on Linux, the usual commands on macOS, PowerShell on Windows.
+One running sampler costs far less than a new connection and a new interpreter
+every few seconds, and it ends by itself when the connection goes.
+
+Aliases listed in ~/.config/hypertop/ssh-skip (one per line) are left out.
+
+While a machine is up it is asked for its MAC address, which is remembered in
+~/.cache/hypertop/ssh-hosts.json, so that it can still be woken once it is off and
+still shows what it is. `ssh --wake MAC` sends the magic packet.
+"""
+import base64
+import glob
+import ipaddress
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+SKIP_FILE = os.path.expanduser("~/.config/hypertop/ssh-skip")
+CONFIG = os.path.expanduser("~/.ssh/config")
+RETRY = 30          # seconds between looks at a host that doesn't answer
+SAMPLE = 5          # seconds between samples
+CACHE = os.path.expanduser("~/.cache/hypertop/ssh-hosts.json")
+
+BATCH = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+# For the one long connection a sampler keeps: notice quickly when it dies.
+LONG = BATCH + ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
+# For peeks and actions: repeated short commands share one connection.
+SHARED = BATCH + ["-o", "ControlMaster=auto", "-o", "ControlPath=~/.cache/hypertop/cm-%C", "-o", "ControlPersist=60"]
+
+LINUX_SAMPLER = r"""
+cpu_temp() {
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    case "$(cat "$h/name")" in
+      k10temp|coretemp|zenpower|cpu_thermal|soc_thermal|cpu-thermal)
+        if [ -r "$h/temp1_input" ]; then echo $(( $(cat "$h/temp1_input") / 1000 )); return; fi ;;
+    esac
+  done
+  if [ -r /sys/class/thermal/thermal_zone0/temp ]; then echo $(( $(cat /sys/class/thermal/thermal_zone0/temp) / 1000 )); fi
+}
+NV=$(command -v nvidia-smi)
+pt=0; pb=0
+while :; do
+  read -r _ a b c d e f g h _ < /proc/stat
+  t=$((a+b+c+d+e+f+g+h)); busy=$((t-d-e)); cpu=
+  if [ "$pt" -gt 0 ] && [ "$t" -gt "$pt" ]; then cpu=$(( (busy-pb)*100/(t-pt) )); fi
+  pt=$t; pb=$busy
+  mem=$(awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} END{if(t) printf "%d",(t-a)*100/t}' /proc/meminfo)
+  disk=$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+  up=$(cut -d. -f1 /proc/uptime)
+  load=$(cut -d" " -f1 /proc/loadavg)
+  gpu=; gt=
+  if [ -n "$NV" ]; then r=$("$NV" --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1); gpu=${r%%,*}; gt=${r##*, }; fi
+  printf 'cpu=%s mem=%s disk=%s uptime=%s temp=%s load=%s gpu=%s gputemp=%s\n' "$cpu" "$mem" "$disk" "$up" "$(cpu_temp)" "$load" "$gpu" "$gt"
+  sleep INTERVAL
+done
+"""
+
+# Temperature comes from a private macOS API that needs no sudo, in Python's ctypes
+# because nothing can be compiled or installed on the host. Only the
+# die sensors: the "tcal" ones read about 52 at all times, being calibration values.
+# Homebrew's Python only: /usr/bin/python3 can be a stub that opens an "install developer
+# tools" dialog on the machine's screen. Without it there is simply no temperature.
+MAC_TEMPERATURE = """
+import ctypes as C, ctypes.util as U
+cf = C.CDLL(U.find_library("CoreFoundation")); io = C.CDLL(U.find_library("IOKit"))
+P = C.c_void_p
+cf.CFStringCreateWithCString.restype = P; cf.CFStringCreateWithCString.argtypes = [P, C.c_char_p, C.c_uint32]
+cf.CFNumberCreate.restype = P; cf.CFNumberCreate.argtypes = [P, C.c_long, P]
+cf.CFDictionaryCreate.restype = P; cf.CFDictionaryCreate.argtypes = [P, P, P, C.c_long, P, P]
+cf.CFArrayGetCount.restype = C.c_long; cf.CFArrayGetCount.argtypes = [P]
+cf.CFArrayGetValueAtIndex.restype = P; cf.CFArrayGetValueAtIndex.argtypes = [P, C.c_long]
+cf.CFRelease.argtypes = [P]
+cf.CFStringGetCString.restype = C.c_bool; cf.CFStringGetCString.argtypes = [P, C.c_char_p, C.c_long, C.c_uint32]
+io.IOHIDEventSystemClientCreate.restype = P; io.IOHIDEventSystemClientCreate.argtypes = [P]
+io.IOHIDEventSystemClientSetMatching.restype = C.c_int; io.IOHIDEventSystemClientSetMatching.argtypes = [P, P]
+io.IOHIDEventSystemClientCopyServices.restype = P; io.IOHIDEventSystemClientCopyServices.argtypes = [P]
+io.IOHIDServiceClientCopyEvent.restype = P; io.IOHIDServiceClientCopyEvent.argtypes = [P, C.c_int64, C.c_int32, C.c_int64]
+io.IOHIDEventGetFloatValue.restype = C.c_double; io.IOHIDEventGetFloatValue.argtypes = [P, C.c_int64]
+io.IOHIDServiceClientCopyProperty.restype = P; io.IOHIDServiceClientCopyProperty.argtypes = [P, P]
+UTF8 = 0x08000100
+s = lambda t: cf.CFStringCreateWithCString(None, t, UTF8)
+page, usage = C.c_int(0xff00), C.c_int(5)
+keys = (P * 2)(s(b"PrimaryUsagePage"), s(b"PrimaryUsage"))
+values = (P * 2)(cf.CFNumberCreate(None, 3, C.byref(page)), cf.CFNumberCreate(None, 3, C.byref(usage)))
+callbacks = [C.addressof(C.c_char.in_dll(cf, n)) for n in ("kCFTypeDictionaryKeyCallBacks", "kCFTypeDictionaryValueCallBacks")]
+client = io.IOHIDEventSystemClientCreate(None)
+io.IOHIDEventSystemClientSetMatching(client, cf.CFDictionaryCreate(None, keys, values, 2, *callbacks))
+services = io.IOHIDEventSystemClientCopyServices(client)
+product, hottest = s(b"Product"), 0.0
+for i in range(cf.CFArrayGetCount(services)):
+    service = cf.CFArrayGetValueAtIndex(services, i)
+    name, buffer = io.IOHIDServiceClientCopyProperty(service, product), C.create_string_buffer(64)
+    if not (name and cf.CFStringGetCString(name, buffer, 64, UTF8) and b"tdie" in buffer.value):
+        continue
+    event = io.IOHIDServiceClientCopyEvent(service, 15, 0, 0)
+    if event:
+        value = io.IOHIDEventGetFloatValue(event, 15 << 16)
+        cf.CFRelease(event)
+        if 0 < value < 150:
+            hottest = max(hottest, value)
+if hottest:
+    print(round(hottest))
+"""
+
+MAC_SAMPLER = r"""
+PY=
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do if [ -x "$p" ]; then PY=$p; break; fi; done
+TEMP_PY='TEMPERATURE_CODE'
+tick=0; temp=
+total=$(sysctl -n hw.memsize); page=$(sysctl -n hw.pagesize)
+boot=$(sysctl -n kern.boottime | sed -E 's/.*[{] sec = ([0-9]+).*/\1/')
+while :; do
+  cpu=$(iostat -n0 -c2 -w1 2>/dev/null | awk 'END{printf "%d", 100-$3}')
+  mem=$(vm_stat | awk -v t="$total" -v p="$page" '/Pages active/{a=$3} /Pages wired/{w=$4} /occupied by compressor/{c=$5} END{printf "%d",(a+w+c)*p*100/t}')
+  disk=$(df -P /System/Volumes/Data 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+  up=$(( $(date +%s) - boot ))
+  load=$(sysctl -n vm.loadavg | awk '{print $2}')
+  if [ -n "$PY" ] && [ $((tick % 6)) = 0 ]; then temp=$("$PY" -I -c "$TEMP_PY" 2>/dev/null); fi
+  tick=$((tick + 1))
+  printf 'cpu=%s mem=%s disk=%s uptime=%s load=%s temp=%s\n' "$cpu" "$mem" "$disk" "$up" "$load" "$temp"
+  sleep INTERVAL
+done
+"""
+
+# Below normal priority: this must never take time from a game or from audio.
+# It ends when the sshd serving it does, which is at once when the connection goes.
+# Nothing else tells it: .NET's console streams ignore a closed pipe, and stdin never
+# reports its end while cmd.exe holds it too.
+WINDOWS_SAMPLER = r"""
+$ErrorActionPreference='Stop'
+(Get-Process -Id $PID).PriorityClass='BelowNormal'
+$a=$PID;$s=$PID
+while($a){$q=Get-CimInstance Win32_Process -Filter "ProcessId=$a";if(-not $q){break};if($q.Name -like 'sshd*'){$s=$a;break};$a=$q.ParentProcessId}
+$nv=Get-Command nvidia-smi -ErrorAction SilentlyContinue
+while(Get-Process -Id $s -ErrorAction SilentlyContinue){
+$c=(Get-CimInstance Win32_Processor|Measure-Object LoadPercentage -Average).Average
+$o=Get-CimInstance Win32_OperatingSystem
+$m=[int](100-100*$o.FreePhysicalMemory/$o.TotalVisibleMemorySize)
+$d=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$p=[int](100-100*$d.FreeSpace/$d.Size)
+$u=[int]((Get-Date)-$o.LastBootUpTime).TotalSeconds
+$g='';$t=''
+if($nv){$r=(& nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits|Select-Object -First 1) -split ',';$g=$r[0].Trim();$t=$r[1].Trim()}
+[Console]::Out.WriteLine("cpu=$c mem=$m disk=$p uptime=$u gpu=$g gputemp=$t")
+[Console]::Out.Flush()
+Start-Sleep -Seconds INTERVAL
+}
+"""
+
+WINDOWS_PS = "powershell -NoProfile -NonInteractive -Command "
+
+lock = threading.Lock()
+
+
+def emit(**fields):
+    line = json.dumps(fields, ensure_ascii=False) + "\n"
+    with lock:
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        except OSError:
+            leave()
+
+
+def leave(*_):
+    try:
+        os.killpg(0, signal.SIGTERM)
+    finally:
+        os._exit(0)
+
+
+def magic_packet(mac):
+    """The Wake-on-LAN packet: six 0xff bytes, then the address sixteen times."""
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(digits) != 12:
+        raise ValueError(f"not a MAC address: {mac}")
+    return b"\xff" * 6 + bytes.fromhex(digits) * 16
+
+
+def usable_mac(text):
+    """A real address, normalised, or None. An all-zero or 02:00:00:00:00:00 address is
+    what a system shows instead of the real one: a wake packet to it would do nothing."""
+    mac = text.replace("-", ":").lower()
+    return None if mac in ("00:00:00:00:00:00", "02:00:00:00:00:00") else mac
+
+
+def wake(mac):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(magic_packet(mac), ("255.255.255.255", 9))
+    print(f"magic packet sent to {mac}")
+
+
+def is_local_network(hostname):
+    """Whether a magic packet could reach it: a private address or a .local name."""
+    if hostname.endswith(".local"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_private
+    except ValueError:
+        return False
+
+
+remembered_lock = threading.Lock()
+
+
+def load_remembered():
+    try:
+        with open(CACHE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def remember(alias, **fields):
+    with remembered_lock:
+        known = load_remembered()
+        entry = known.setdefault(alias, {})
+        if all(entry.get(k) == v for k, v in fields.items()):
+            return
+        entry.update(fields)
+        partial = CACHE + ".tmp"
+        with open(partial, "w") as fh:
+            json.dump(known, fh)
+        os.replace(partial, CACHE)
+
+
+def read_hosts(path, seen=None):
+    """The Host blocks of an ssh config: each one's aliases, Includes followed."""
+    seen = set() if seen is None else seen
+    path = os.path.expanduser(path)
+    if path in seen or not os.path.isfile(path):
+        return []
+    seen.add(path)
+    blocks = []
+    with open(path, errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.replace("=", " ", 1).split(None, 1)
+            key = parts[0].lower()
+            value = parts[1] if len(parts) > 1 else ""
+            if key == "host":
+                blocks.append([a for a in value.split() if not set(a) & set("*?!")])
+            elif key == "include":
+                for pattern in value.split():
+                    pattern = os.path.expanduser(pattern)
+                    if not os.path.isabs(pattern):
+                        pattern = os.path.join(os.path.dirname(CONFIG), pattern)
+                    for included in sorted(glob.glob(pattern)):
+                        blocks.extend(read_hosts(included, seen))
+    return [b for b in blocks if b]
+
+
+def read_skip():
+    try:
+        with open(SKIP_FILE) as fh:
+            return {line.split("#")[0].strip() for line in fh} - {""}
+    except OSError:
+        return set()
+
+
+def ssh_settings(alias):
+    r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    found = {}
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        found.setdefault(key, value)
+    return found.get("hostname", alias), int(found.get("port", 22)), found.get("user", "")
+
+
+def own_addresses():
+    addresses = {"127.0.0.1", "::1"}
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("192.0.2.1", 9))  # picks the outgoing address, sends nothing
+        addresses.add(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    return addresses
+
+
+class Host:
+    def __init__(self, aliases, own):
+        self.alias = aliases[0]
+        self.aliases = aliases
+        self.hostname, self.port, self.user = ssh_settings(self.alias)
+        self.local = self.hostname in own
+        self.system = None
+
+    def reachable(self):
+        if self.local:
+            return True
+        try:
+            socket.create_connection((self.hostname, self.port), timeout=3).close()
+            return True
+        except OSError:
+            return False
+
+    def argv(self, options, command):
+        return ["ssh", *options, self.alias, command]
+
+    def ask(self, command, timeout=12):
+        if self.local:
+            argv = ["sh", "-c", command]
+        else:
+            argv = self.argv(BATCH, command)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, errors="replace")
+
+    def detect(self):
+        """Which system this is. cmd.exe expands %OS%, and nothing else does."""
+        r = self.ask("echo %OS%; uname -s")
+        if r.returncode == 255 or (r.returncode != 0 and not r.stdout.strip()):
+            raise OSError((r.stderr.strip().splitlines() or ["ssh failed"])[-1])
+        if "Windows_NT" in r.stdout:
+            self.system = "Windows"
+        else:
+            words = r.stdout.split()
+            self.system = {"Darwin": "macOS"}.get(words[-1], words[-1]) if words else "unknown"
+
+    def version(self):
+        command = {
+            "Linux": "sed -n 's/^PRETTY_NAME=//p' /etc/os-release",
+            "macOS": "sw_vers -productVersion",
+            "Windows": "ver",
+        }.get(self.system)
+        if not command:
+            return ""
+        lines = [line.strip().strip('"') for line in self.ask(command).stdout.splitlines() if line.strip()]
+        text = lines[0] if lines else ""
+        if self.system == "Windows":
+            match = re.search(r"Version (\d+\.\d+\.\d+)", text)
+            return f"Windows {match.group(1)}" if match else text
+        return f"macOS {text}" if self.system == "macOS" and text else text
+
+    def mac_address(self):
+        """The address of the interface this machine reaches the network through."""
+        unix = {
+            "Linux": "i=$(ip route show default 2>/dev/null | awk '{print $5; exit}'); cat /sys/class/net/$i/address",
+            # networksetup: ifconfig can show a placeholder instead of the real address.
+            "macOS": "i=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}'); networksetup -getmacaddress $i",
+        }.get(self.system)
+        if unix:
+            command = "sh -c " + shlex.quote(unix)
+        elif self.system == "Windows":
+            command = WINDOWS_PS + '"(Get-NetAdapter -InterfaceIndex (Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1).ifIndex).MacAddress"'
+        else:
+            return None
+        found = re.search(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", self.ask(command).stdout)
+        return usable_mac(found.group(0)) if found else None
+
+    def has(self, tool):
+        probe = f"where {tool}" if self.system == "Windows" else f"command -v {tool}"
+        return self.ask(probe).returncode == 0
+
+    def peek_command(self, command):
+        return ["sh", "-c", command] if self.local else self.argv(SHARED, command)
+
+    def peeks(self):
+        def unix(command):
+            return self.peek_command("sh -c " + shlex.quote(command))
+
+        def windows(script):
+            return self.peek_command(WINDOWS_PS + '"' + script + '"')
+
+        if self.system == "Linux":
+            found = [
+                ("processes", unix("ps -eo pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -24 || top -bn1 | head -24"), 3),
+                ("disks", unix("df -h -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null || df -h"), 15),
+                ("network", unix("ip -br addr 2>/dev/null || ifconfig"), 15),
+                ("failed", unix("systemctl --failed --no-pager --no-legend 2>&1; systemctl --user --failed --no-pager --no-legend 2>&1"), 15),
+                ("warnings", unix("journalctl -p warning -n 40 --no-pager 2>/dev/null"), 15),
+            ]
+            if self.has("nvidia-smi"):
+                found.insert(1, ("gpu", unix("nvidia-smi"), 5))
+        elif self.system == "macOS":
+            found = [
+                # Not ps: on macOS its %CPU is a lifetime average, not what is busy now.
+                ("processes", unix("top -l 2 -s 1 -n 22 -o cpu -stats pid,cpu,mem,command | awk '/^PID/{n++} n==2' | cut -c1-90"), 5),
+                ("disks", unix("df -h | grep -vE '^(map|devfs)'"), 15),
+                ("network", unix("ifconfig | grep -E '^[a-z]|inet ' | grep -B1 'inet ' | grep -v '^--'"), 15),
+            ]
+        elif self.system == "Windows":
+            found = [
+                ("processes", windows("Get-Process | Sort-Object CPU -Descending | Select-Object -First 22 Name,Id,SI,@{n='CPU s';e={[int]$_.CPU}},@{n='MB';e={[int]($_.WS/1MB)}} | Format-Table -AutoSize | Out-String -Width 110"), 5),
+                ("disks", windows("Get-PSDrive -PSProvider FileSystem | Select-Object Name,@{n='Used GB';e={[int]($_.Used/1GB)}},@{n='Free GB';e={[int]($_.Free/1GB)}},Root | Format-Table -AutoSize | Out-String -Width 110"), 15),
+                ("network", self.peek_command("ipconfig"), 15),
+            ]
+            if self.has("nvidia-smi"):
+                found.insert(1, ("gpu", self.peek_command("nvidia-smi"), 5))
+        else:
+            found = [("uptime", unix("uptime; df -h 2>/dev/null | head -12"), 10)]
+        return [{"label": label, "run": run, "every": every} for label, run, every in found]
+
+    def actions(self):
+        if self.local:
+            shell = [os.environ.get("SHELL", "/bin/sh")]
+            run = ["sh", "-c", "{input}"]
+        else:
+            shell = ["ssh", self.alias]
+            run = self.argv(SHARED, "{input}")
+        found = [
+            {"id": "shell", "label": "Open a shell", "run": shell, "tty": True},
+            {"id": "run", "label": "Run a command", "run": run, "input": "Command"},
+        ]
+        power = {
+            "Linux": [("reboot", "Reboot", "sudo -n reboot"), ("poweroff", "Power off", "sudo -n poweroff"), ("suspend", "Suspend", "systemctl suspend")],
+            "macOS": [("reboot", "Reboot", "sudo -n shutdown -r now"), ("poweroff", "Power off", "sudo -n shutdown -h now"), ("suspend", "Sleep", "pmset sleepnow")],
+            "Windows": [("reboot", "Reboot", "shutdown /r /t 5"), ("poweroff", "Power off", "shutdown /s /t 5")],
+        }.get(self.system, [])
+        for action, label, command in power:
+            found.append({"id": action, "label": label, "run": self.peek_command(command), "confirm": True})
+        return found
+
+    def actions_while_off(self, mac):
+        found = [{"id": "shell", "label": "Open a shell", "run": ["ssh", self.alias], "tty": True}]
+        if mac and is_local_network(self.hostname):
+            found.insert(0, {"id": "wake", "label": "Wake (magic packet)",
+                             "run": [sys.executable, os.path.abspath(__file__), "--wake", mac]})
+        return found
+
+    def info(self):
+        address = self.hostname if self.port == 22 else f"{self.hostname}:{self.port}"
+        info = {"address": address}
+        if self.user:
+            info["user"] = self.user
+        if len(self.aliases) > 1:
+            info["also"] = " ".join(self.aliases[1:])
+        return info
+
+    def sampler(self):
+        script = {"Linux": LINUX_SAMPLER, "macOS": MAC_SAMPLER, "Windows": WINDOWS_SAMPLER}.get(self.system)
+        if script is None:
+            return None, None
+        script = script.replace("INTERVAL", str(SAMPLE)).replace("TEMPERATURE_CODE", MAC_TEMPERATURE)
+        if self.system == "Windows":
+            encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+            return self.argv(LONG, "powershell -NoProfile -NonInteractive -EncodedCommand " + encoded), None
+        if self.local:
+            return ["sh", "-s"], script
+        return self.argv(LONG, "sh -s"), script
+
+    def sample_until_gone(self):
+        """Run the sampler and report what it prints, until the connection ends."""
+        argv, script = self.sampler()
+        if argv is None:
+            emit(id=self.alias, state="up", metrics={})
+            time.sleep(RETRY)
+            return
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+        if script:
+            proc.stdin.write(script)
+            proc.stdin.flush()
+        for line in proc.stdout:
+            metrics = {}
+            for word in line.split():
+                key, _, value = word.partition("=")
+                try:
+                    metrics[key] = float(value)
+                except ValueError:
+                    pass
+            if metrics:
+                emit(id=self.alias, state="up", alert=None, metrics=metrics)
+        proc.wait()
+
+
+def watch(host):
+    known = load_remembered().get(host.alias, {})
+    emit(id=host.alias, name=host.alias, group="computers", kind=known.get("system", "?"), state="unknown", info=host.info())
+    was_off = False
+    while True:
+        if not host.reachable():
+            if not was_off:
+                known = load_remembered().get(host.alias, {})
+                emit(id=host.alias, state="down", metrics={}, note=known.get("version", ""), peeks=[],
+                     actions=host.actions_while_off(known.get("mac")))
+                was_off = True
+            time.sleep(RETRY)
+            continue
+        was_off = False
+        try:
+            host.detect()
+            version = host.version()
+            remember(host.alias, system=host.system, version=version)
+            mac = host.mac_address()
+            if mac:
+                remember(host.alias, mac=mac)
+            emit(id=host.alias, kind=host.system, note=version, state="up", alert=None,
+                 peeks=host.peeks(), actions=host.actions())
+        except (OSError, subprocess.SubprocessError) as exc:
+            emit(id=host.alias, state="unknown", alert=f"ssh: {exc}", metrics={},
+                 actions=[{"id": "shell", "label": "Open a shell", "run": ["ssh", host.alias], "tty": True}])
+            time.sleep(RETRY)
+            continue
+        host.sample_until_gone()
+        time.sleep(3)
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--wake":
+        try:
+            wake(sys.argv[2])
+        except (ValueError, OSError) as exc:
+            sys.exit(str(exc))
+        return
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    os.makedirs(os.path.expanduser("~/.cache/hypertop"), mode=0o700, exist_ok=True)
+
+    def when_stdin_closes():
+        sys.stdin.buffer.read()
+        leave()
+
+    threading.Thread(target=when_stdin_closes, daemon=True).start()
+    skip = read_skip()
+    own = own_addresses()
+    for aliases in read_hosts(CONFIG):
+        if set(aliases) & skip:
+            continue
+        threading.Thread(target=lambda a=aliases: watch(Host(a, own)), daemon=True).start()
+    threading.Event().wait()
+
+
+if __name__ == "__main__":
+    main()

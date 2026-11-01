@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""hypertop source: every pcmlink stream reaching this machine, through pcmlink-mixer."""
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+mixer = shutil.which("pcmlink-mixer") or os.path.expanduser("~/bin/pcmlink-mixer")
+if not os.path.exists(mixer):
+    sys.exit(0)  # no pcmlink here: no devices, and nothing wrong
+sockets = os.environ.get("PCMLINK_RX_DIR") or os.path.expanduser("~/Library/Application Support/pcmlink/rx")
+print(json.dumps({"every": 10}), flush=True)
+clients = json.loads(subprocess.run([mixer, "--json"], capture_output=True, text=True, timeout=10).stdout or "[]")
+
+
+def say(line, socket):
+    return ["sh", "-c", f"printf '{line}\\n' | nc -U {shlex.quote(socket)}"]
+
+
+for client in clients:
+    apps = client.get("apps", [])
+    playing = [f"{a['name']}{' (muted)' if a.get('mute') else ''}" for a in apps if a.get("active") or a.get("mute")]
+    for stream in client.get("streams", []):
+        port = stream["port"]
+        socket = os.path.join(sockets, f"{port}.sock")
+        flowing = stream.get("age_ms", 99999) < 2000 and stream.get("packets", 0) > 0
+        peak = max(stream.get("peak", [0, 0]) or [0])
+        print(json.dumps({
+            "id": str(port),
+            "name": f"{client.get('name') or 'no sender'} :{port}",
+            "group": "audio links",
+            "kind": "stream",
+            "state": "up" if flowing else "idle",
+            "note": ("MUTED  " if stream.get("mute") else "") + (", ".join(playing) or ("carrying audio" if peak > 0.001 else "silent")),
+            "metrics": {"buffer ms": stream.get("buf_ms", 0), "lost": stream.get("lost", 0), "dropouts": stream.get("under", 0)},
+            "info": {"from": str(client.get("host") or client.get("address") or "nobody"), "to": str(stream.get("device"))},
+            "peeks": [{"label": "mixer", "run": [mixer, "--list"], "every": 5}],
+            "actions": [
+                {"id": "mixer", "label": "Open the mixer", "run": [mixer], "tty": True},
+                {"id": "mute", "label": "Mute", "run": say("mute 1", socket)},
+                {"id": "unmute", "label": "Unmute", "run": say("mute 0", socket)},
+            ],
+        }, ensure_ascii=False))
