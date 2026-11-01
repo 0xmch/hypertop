@@ -9,22 +9,26 @@ mod run;
 mod ui;
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::crossterm::execute;
 
 use model::{Action, GroupBy, Model, Row, State};
 use run::{Msg, Running};
 
+/// How often to look for news from the sources. Input doesn't wait for this.
 const FRAME: Duration = Duration::from_millis(100);
+/// A redraw with no news, for what depends on the clock ("up for 45s").
+const CLOCK: Duration = Duration::from_secs(1);
+/// A peek starts once the selection has stayed put this long, so that passing over
+/// a device doesn't ask it anything.
+const SETTLE: Duration = Duration::from_millis(150);
 const NOTICE: Duration = Duration::from_secs(6);
 const PAGE: i32 = 10;
 
@@ -120,9 +124,11 @@ pub struct App {
     pub jobs: Vec<Job>,
     pub notice: Option<(String, Instant)>,
     pub peeks: HashMap<(String, String), PeekState>,
+    moved: Instant,
+    /// What's listed, worked out again only when the model or the view changes.
+    pub rows: Vec<Row>,
     /// Where the rows landed on screen, for the mouse.
     pub list_area: ratatui::layout::Rect,
-    pub list_rows: Vec<Row>,
     pub sources: usize,
     pub dir: PathBuf,
     tty_request: Option<Vec<String>>,
@@ -154,8 +160,9 @@ impl App {
             jobs: Vec::new(),
             notice: None,
             peeks: HashMap::new(),
+            moved: Instant::now(),
+            rows: Vec::new(),
             list_area: Default::default(),
-            list_rows: Vec::new(),
             sources,
             dir: opts.dir.clone(),
             tty_request: None,
@@ -170,25 +177,44 @@ impl App {
         self.notice = Some((text.into(), Instant::now()));
     }
 
-    pub fn rows(&self) -> Vec<Row> {
-        self.model.rows(&self.filter, self.hide_down, self.group_by)
+    fn device_keys(&self) -> impl Iterator<Item = &String> {
+        self.rows.iter().filter_map(|row| match row {
+            Row::Device(key) => Some(key),
+            Row::Header { .. } => None,
+        })
     }
 
-    fn device_keys(&self) -> Vec<String> {
-        self.rows()
-            .into_iter()
-            .filter_map(|row| match row {
-                Row::Device(key) => Some(key),
-                Row::Header { .. } => None,
-            })
-            .collect()
+    /// The model or the view changed. The selection follows its device; if that went
+    /// away, take the first.
+    fn refresh_rows(&mut self) {
+        self.rows = self.model.rows(&self.filter, self.hide_down, self.group_by);
+        let present = self.selected.as_ref().is_some_and(|s| self.device_keys().any(|k| k == s));
+        if !self.chosen || !present {
+            let first = self.device_keys().next().cloned();
+            if self.selected != first {
+                self.selected = first;
+                self.tab = 0;
+                self.detail_scroll = 0;
+                self.moved = Instant::now();
+            }
+        }
     }
 
-    fn pump(&mut self) {
+    /// Take in what happened in the background. True if the screen may have to change.
+    fn pump(&mut self) -> bool {
+        let mut changed = false;
+        let mut devices_changed = false;
         while let Ok(message) = self.rx.try_recv() {
+            changed = true;
             match message {
-                Msg::Line { source, line } => self.model.line(&source, &line),
-                Msg::Exited { source, success, why } => self.model.source_exited(&source, success, &why),
+                Msg::Line { source, line } => {
+                    self.model.line(&source, &line);
+                    devices_changed = true;
+                }
+                Msg::Exited { source, success, why } => {
+                    self.model.source_exited(&source, success, &why);
+                    devices_changed = true;
+                }
                 Msg::Peek { key, label, text } => {
                     let state = self.peeks.entry((key, label)).or_insert(PeekState { text: String::new(), ran: None, running: false });
                     state.text = text;
@@ -204,20 +230,15 @@ impl App {
                 Msg::JobDone { job, outcome } => self.job_done(job, outcome),
             }
         }
-        // The selection follows its device; if that went away, take the first.
-        let keys = self.device_keys();
-        if !self.chosen || !self.selected.as_ref().is_some_and(|s| keys.contains(s)) {
-            let first = keys.first().cloned();
-            if self.selected != first {
-                self.selected = first;
-                self.tab = 0;
-                self.detail_scroll = 0;
-            }
+        if devices_changed {
+            self.refresh_rows();
         }
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() >= NOTICE) {
             self.notice = None;
+            changed = true;
         }
         self.run_visible_peek();
+        changed
     }
 
     fn job_done(&mut self, job: usize, outcome: Result<i32, String>) {
@@ -235,7 +256,7 @@ impl App {
     /// Peeks run only for the tab on screen, and stop when you look away: nothing
     /// is asked of a device unless someone is reading the answer.
     fn run_visible_peek(&mut self) {
-        if !self.detail_open || self.tab == 0 {
+        if !self.detail_open || self.tab == 0 || self.moved.elapsed() < SETTLE {
             return;
         }
         let Some(key) = self.selected.clone() else { return };
@@ -249,13 +270,13 @@ impl App {
     }
 
     fn move_selection(&mut self, by: i32) {
-        let keys = self.device_keys();
+        let keys: Vec<&String> = self.device_keys().collect();
         if keys.is_empty() {
             return;
         }
-        let at = self.selected.as_ref().and_then(|s| keys.iter().position(|k| k == s)).unwrap_or(0) as i32;
-        let next = (at + by).clamp(0, keys.len() as i32 - 1) as usize;
-        self.select(keys[next].clone());
+        let at = self.selected.as_ref().and_then(|s| keys.iter().position(|k| *k == s)).unwrap_or(0) as i32;
+        let next = keys[(at + by).clamp(0, keys.len() as i32 - 1) as usize].clone();
+        self.select(next);
     }
 
     fn select(&mut self, key: String) {
@@ -263,6 +284,7 @@ impl App {
         if self.selected.as_ref() != Some(&key) {
             self.selected = Some(key);
             self.detail_scroll = 0;
+            self.moved = Instant::now();
             // Tabs differ between devices; stay on the same one if it exists here.
             let peeks = self.selected.as_ref().and_then(|k| self.model.get(k)).map_or(0, |d| d.peeks.len());
             if self.tab > peeks {
@@ -272,10 +294,10 @@ impl App {
     }
 
     fn next_attention(&mut self) {
-        let keys = self.device_keys();
-        let at = self.selected.as_ref().and_then(|s| keys.iter().position(|k| k == s)).unwrap_or(0);
+        let keys: Vec<&String> = self.device_keys().collect();
+        let at = self.selected.as_ref().and_then(|s| keys.iter().position(|k| *k == s)).unwrap_or(0);
         let wants = |key: &String| self.model.get(key).is_some_and(|d| d.attention().is_some());
-        let next = keys.iter().skip(at + 1).chain(keys.iter().take(at + 1)).find(|k| wants(k)).cloned();
+        let next = keys.iter().skip(at + 1).chain(keys.iter().take(at + 1)).find(|k| wants(k)).map(|k| (*k).clone());
         match next {
             Some(key) => self.select(key),
             None => self.say("nothing needs attention"),
@@ -284,7 +306,7 @@ impl App {
 
     /// What an action applies to: everything tagged, or else the selected device.
     fn targets(&self) -> Vec<String> {
-        let tagged: Vec<String> = self.device_keys().into_iter().filter(|k| self.model.get(k).is_some_and(|d| d.tagged)).collect();
+        let tagged: Vec<String> = self.device_keys().filter(|k| self.model.get(k).is_some_and(|d| d.tagged)).cloned().collect();
         if !tagged.is_empty() {
             return tagged;
         }
@@ -438,7 +460,7 @@ impl App {
                 self.move_selection(1);
             }
             KeyCode::Char('t') => {
-                let keys = self.device_keys();
+                let keys: Vec<String> = self.device_keys().cloned().collect();
                 let all = keys.iter().all(|k| self.model.get(k).is_some_and(|d| d.tagged));
                 for key in keys {
                     if let Some(device) = self.model.get_mut(&key) {
@@ -451,6 +473,7 @@ impl App {
             KeyCode::Esc => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
+                    self.refresh_rows();
                 } else {
                     self.model.devices.iter_mut().for_each(|d| d.tagged = false);
                 }
@@ -486,8 +509,12 @@ impl App {
                     GroupBy::Kind => GroupBy::Nothing,
                     GroupBy::Nothing => GroupBy::Group,
                 };
+                self.refresh_rows();
             }
-            KeyCode::Char('d') => self.hide_down = !self.hide_down,
+            KeyCode::Char('d') => {
+                self.hide_down = !self.hide_down;
+                self.refresh_rows();
+            }
             KeyCode::Char('n') => self.next_attention(),
             KeyCode::Char('r') => {
                 self.wakes.iter().for_each(|wake| {
@@ -523,6 +550,7 @@ impl App {
             }
             _ => self.mode = Mode::Filter,
         }
+        self.refresh_rows();
     }
 
     fn key_menu(&mut self, key: KeyEvent, items: Vec<MenuItem>, at: usize) {
@@ -588,11 +616,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
             KeyCode::PageUp => scroll = scroll.saturating_sub(PAGE as u16),
             KeyCode::PageDown => scroll = scroll.saturating_add(PAGE as u16),
-            KeyCode::Char('c') => {
-                if self.jobs.iter().all(|j| j.outcome.is_some()) {
-                    self.jobs.clear();
-                    scroll = 0;
-                }
+            KeyCode::Char('c') if self.jobs.iter().all(|j| j.outcome.is_some()) => {
+                self.jobs.clear();
+                scroll = 0;
             }
             _ => {}
         }
@@ -607,7 +633,7 @@ impl App {
             MouseEventKind::ScrollDown if matches!(self.mode, Mode::Normal) => self.move_selection(1),
             MouseEventKind::Down(MouseButton::Left) if inside && matches!(self.mode, Mode::Normal) => {
                 let row = self.top + (event.row - area.y) as usize;
-                if let Some(Row::Device(key)) = self.list_rows.get(row).cloned() {
+                if let Some(Row::Device(key)) = self.rows.get(row).cloned() {
                     // The first columns are the tag; elsewhere a click selects.
                     if event.column <= area.x + 2 {
                         if let Some(device) = self.model.get_mut(&key) {
@@ -622,59 +648,78 @@ impl App {
     }
 }
 
+/// Clicks and the wheel. crossterm's EnableMouseCapture also asks for every movement
+/// of the mouse, which nothing here reads.
+fn mouse_capture(on: bool) -> io::Result<()> {
+    let mut out = io::stdout();
+    out.write_all(if on { b"\x1b[?1000h\x1b[?1006h" } else { b"\x1b[?1006l\x1b[?1000l" })?;
+    out.flush()
+}
+
+/// Wait for input, for at most `wait`, and handle all that has come, so that a held
+/// key can't fall behind the screen. Some(true) if there was any, None to quit.
+fn take_input(app: &mut App, wait: Duration) -> io::Result<Option<bool>> {
+    if !event::poll(wait)? {
+        return Ok(Some(false));
+    }
+    loop {
+        match event::read()? {
+            Event::Key(key) => {
+                if !app.key(key) {
+                    return Ok(None);
+                }
+            }
+            Event::Mouse(mouse) => app.mouse(mouse),
+            _ => {}
+        }
+        if !event::poll(Duration::ZERO)? {
+            return Ok(Some(true));
+        }
+    }
+}
+
+/// Draws only when something changed: input at once, what the sources say at most
+/// every FRAME, and the rest of the time nothing.
 fn run_tui(opts: &Opts) -> io::Result<()> {
     let mut app = App::new(opts);
     let mut terminal = ratatui::init();
-    execute!(io::stdout(), EnableMouseCapture)?;
+    mouse_capture(true)?;
+    let mut dirty = true;
+    let mut drawn = Instant::now();
     let result = loop {
-        app.pump();
-        if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
-            break Err(e);
+        dirty |= app.pump();
+        if dirty || drawn.elapsed() >= CLOCK {
+            if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
+                break Err(e);
+            }
+            dirty = false;
+            drawn = Instant::now();
         }
         if let Some(argv) = app.tty_request.take() {
             // Hand the terminal over, and take it back when the command ends.
-            let _ = execute!(io::stdout(), DisableMouseCapture);
+            let _ = mouse_capture(false);
             ratatui::restore();
             println!("hypertop: {}", argv.join(" "));
             let status = Command::new(&argv[0]).args(&argv[1..]).status();
+            // A new terminal starts with a blank screen and an empty buffer, so the next
+            // draw paints everything. Terminal::clear would add nothing, except a wait of
+            // up to 2 s for the terminal to report its cursor, swallowing keys meanwhile.
             terminal = ratatui::init();
-            execute!(io::stdout(), EnableMouseCapture)?;
-            terminal.clear()?;
+            mouse_capture(true)?;
             if let Err(e) = status {
                 app.say(format!("{}: {e}", argv[0]));
             }
+            dirty = true;
             continue;
         }
-        let deadline = Instant::now() + FRAME;
-        let mut go = true;
-        while go {
-            match event::poll(deadline.saturating_duration_since(Instant::now())) {
-                Ok(false) => break,
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) => go = app.key(key),
-                    Ok(Event::Mouse(mouse)) => app.mouse(mouse),
-                    Ok(_) => {}
-                    Err(e) => {
-                        app.running.stop_all();
-                        let _ = execute!(io::stdout(), DisableMouseCapture);
-                        ratatui::restore();
-                        return Err(e);
-                    }
-                },
-                Err(e) => {
-                    app.running.stop_all();
-                    let _ = execute!(io::stdout(), DisableMouseCapture);
-                    ratatui::restore();
-                    return Err(e);
-                }
-            }
-        }
-        if !go {
-            break Ok(());
+        match take_input(&mut app, FRAME) {
+            Ok(Some(input)) => dirty |= input,
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
         }
     };
     app.running.stop_all();
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    let _ = mouse_capture(false);
     ratatui::restore();
     result
 }
@@ -683,11 +728,11 @@ fn print_list(app: &App) {
     if app.sources == 0 {
         println!("no sources in {}", app.dir.display());
     }
-    for row in app.rows() {
+    for row in &app.rows {
         match row {
             Row::Header { title, up, total } => println!("{title} ({up}/{total} up)"),
             Row::Device(key) => {
-                let Some(d) = app.model.get(&key) else { continue };
+                let Some(d) = app.model.get(key) else { continue };
                 let state = match d.state {
                     State::Up => "up",
                     State::Idle => "idle",

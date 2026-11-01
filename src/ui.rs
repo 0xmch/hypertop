@@ -1,4 +1,7 @@
-//! Drawing. Everything is computed from the model on every frame.
+//! Drawing: the state of the app, as it is now, onto the screen. The main loop calls
+//! this only when something changed. What it costs should depend on the size of the
+//! screen, as far as possible, and not on the number of devices or on how much a
+//! device said.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -224,10 +227,10 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let rows = app.rows();
     if area.height < 2 {
         return;
     }
+    let rows = &app.rows;
     if rows.is_empty() {
         let text = if app.sources == 0 {
             format!("No sources yet. Put executables that print devices in {}", app.dir.display())
@@ -237,10 +240,9 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             "Asking the sources…".to_string()
         };
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }).style(DIM), area);
-        app.list_rows = rows;
         return;
     }
-    let (chosen, spark) = columns_for(app, &rows, area.width as usize);
+    let (chosen, spark) = columns_for(app, rows, area.width as usize);
     frame.render_widget(Paragraph::new(header_line(&chosen, spark)), Rect::new(area.x, area.y, area.width, 1));
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
 
@@ -285,7 +287,6 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.buffer_mut().set_style(row, Style::new().bg(Color::Indexed(238)));
     }
     app.list_area = body;
-    app.list_rows = rows;
 }
 
 fn overview_lines(device: &Device) -> Vec<Line<'static>> {
@@ -339,16 +340,17 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let (scroll, height) = (app.detail_scroll as usize, inner.height as usize);
     let lines: Vec<Line> = if app.tab == 0 {
-        overview_lines(device)
+        overview_lines(device).into_iter().skip(scroll).take(height).collect()
     } else {
         let label = device.peeks.get(app.tab - 1).map(|p| p.label.clone()).unwrap_or_default();
         match app.peeks.get(&(device.key.clone(), label)) {
-            Some(state) if state.ran.is_some() => state.text.lines().map(|l| Line::raw(l.to_string())).collect(),
+            Some(state) if state.ran.is_some() => state.text.lines().skip(scroll).take(height).map(|l| Line::raw(l.to_string())).collect(),
             _ => vec![Line::from(Span::styled("asking…", DIM))],
         }
     };
-    frame.render_widget(Paragraph::new(lines).scroll((app.detail_scroll, 0)), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -520,9 +522,9 @@ fn draw_jobs(frame: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = if app.jobs.is_empty() {
         vec![Line::from(Span::styled("Nothing has run yet.", DIM))]
     } else {
-        app.jobs.iter().flat_map(job_lines).collect()
+        app.jobs.iter().flat_map(job_lines).skip(*scroll as usize).take(inner.height as usize).collect()
     };
-    frame.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {

@@ -39,7 +39,8 @@ lines: a device's numbers, what can be peeked at, and which commands are its act
 Adding a kind of device means adding a short script, whatever the language.
 
 **Peeking costs nothing until you look.** The table shows what sources report at their
-own pace. A peek tab runs its command only while it is on screen.
+own pace. A peek tab runs its command only while it is on screen, and only once you
+have stopped on that device, so moving through the list asks nothing of what you pass.
 
 **Acting scales.** Tag devices with space (`t` tags everything shown, so filter and then
 `t` tags a whole class), then press Enter for actions or `!` for a command. Each device

@@ -183,15 +183,15 @@ impl Device {
         })
     }
 
+    /// `filter` is already lower case.
     fn matches(&self, filter: &str) -> bool {
         if filter.is_empty() {
             return true;
         }
-        let filter = filter.to_lowercase();
         [&self.name, &self.kind, &self.group, &self.note]
             .into_iter()
             .chain(self.info.values())
-            .any(|text| text.to_lowercase().contains(&filter))
+            .any(|text| text.to_lowercase().contains(filter))
     }
 }
 
@@ -211,19 +211,35 @@ pub enum Row {
 /// The name a failed source goes by in the list.
 const SOURCE_FAILED: &str = "!";
 
+/// The section a device goes under.
+fn section(device: &Device, group_by: GroupBy) -> &str {
+    match group_by {
+        GroupBy::Group => &device.group,
+        GroupBy::Kind => &device.kind,
+        GroupBy::Nothing => "",
+    }
+}
+
 #[derive(Default)]
 pub struct Model {
     pub devices: Vec<Device>,
+    /// Where each key is in `devices`. Only this file adds or removes devices.
+    index: HashMap<String, usize>,
     seen_this_run: HashMap<String, HashSet<String>>,
 }
 
 impl Model {
     pub fn get(&self, key: &str) -> Option<&Device> {
-        self.devices.iter().find(|d| d.key == key)
+        self.index.get(key).map(|&at| &self.devices[at])
     }
 
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Device> {
-        self.devices.iter_mut().find(|d| d.key == key)
+        let at = *self.index.get(key)?;
+        Some(&mut self.devices[at])
+    }
+
+    fn reindex(&mut self) {
+        self.index = self.devices.iter().enumerate().map(|(at, d)| (d.key.clone(), at)).collect();
     }
 
     /// One line from a source. A line with no id says nothing about any device.
@@ -235,10 +251,11 @@ impl Model {
         };
         self.seen_this_run.entry(source.to_string()).or_default().insert(id.clone());
         let key = format!("{source}/{id}");
-        let at = match self.devices.iter().position(|d| d.key == key) {
-            Some(at) => at,
+        let at = match self.index.get(&key) {
+            Some(&at) => at,
             None => {
                 self.devices.push(Device::new(source, &id));
+                self.index.insert(key, self.devices.len() - 1);
                 self.devices.len() - 1
             }
         };
@@ -262,6 +279,7 @@ impl Model {
             device.alert = Some(if why.is_empty() { "failed".to_string() } else { why.to_string() });
             self.devices.push(device);
         }
+        self.reindex();
     }
 
     pub fn counts(&self) -> (usize, usize, usize, usize) {
@@ -274,29 +292,20 @@ impl Model {
     /// What's on screen, in order. Sorted by name only, so a row stays where you
     /// last saw it when its numbers change.
     pub fn rows(&self, filter: &str, hide_down: bool, group_by: GroupBy) -> Vec<Row> {
+        let filter = filter.to_lowercase();
         let mut shown: Vec<&Device> = self
             .devices
             .iter()
-            .filter(|d| d.matches(filter) && (!hide_down || d.state != State::Down))
+            .filter(|d| d.matches(&filter) && (!hide_down || d.state != State::Down))
             .collect();
-        let section = |d: &Device| match group_by {
-            GroupBy::Group => d.group.clone(),
-            GroupBy::Kind => d.kind.clone(),
-            GroupBy::Nothing => String::new(),
-        };
-        shown.sort_by_key(|d| (section(d).to_lowercase(), d.name.to_lowercase(), d.key.clone()));
+        shown.sort_by_cached_key(|d| (section(d, group_by).to_lowercase(), d.name.to_lowercase(), d.key.clone()));
         let mut rows = Vec::with_capacity(shown.len() + 8);
-        let mut current = None;
-        for device in &shown {
-            let title = section(device);
-            if group_by != GroupBy::Nothing && current.as_ref() != Some(&title) {
-                let members = shown.iter().filter(|d| section(d) == title);
-                let total = members.clone().count();
-                let up = members.filter(|d| d.state == State::Up).count();
-                rows.push(Row::Header { title: title.clone(), up, total });
-                current = Some(title);
+        for members in shown.chunk_by(|a, b| section(a, group_by) == section(b, group_by)) {
+            if group_by != GroupBy::Nothing {
+                let up = members.iter().filter(|d| d.state == State::Up).count();
+                rows.push(Row::Header { title: section(members[0], group_by).to_string(), up, total: members.len() });
             }
-            rows.push(Row::Device(device.key.clone()));
+            rows.extend(members.iter().map(|d| Row::Device(d.key.clone())));
         }
         rows
     }
@@ -400,6 +409,19 @@ mod tests {
         m.line("s", &json!({"id": "b"}));
         m.source_exited("s", true, "");
         assert!(m.get("s/!").is_none(), "recovered");
+    }
+
+    #[test]
+    fn devices_can_still_be_found_after_others_go_away() {
+        let mut m = model();
+        m.source_exited("s", true, ""); // saw both
+        m.line("s", &json!({"id": "b", "note": "still here"}));
+        m.source_exited("s", true, "");
+        assert!(m.get("s/a").is_none());
+        assert_eq!(m.get("s/b").unwrap().note, "still here");
+        assert_eq!(m.get("t/c").unwrap().note, "hello");
+        m.get_mut("t/c").unwrap().tagged = true;
+        assert!(m.devices.iter().find(|d| d.key == "t/c").unwrap().tagged);
     }
 
     #[test]
