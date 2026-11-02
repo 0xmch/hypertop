@@ -7,7 +7,9 @@ already has: /proc on Linux, the usual commands on macOS, PowerShell on Windows.
 One running sampler costs far less than a new connection and a new interpreter
 every few seconds, and it ends by itself when the connection goes.
 
-Aliases listed in ~/.config/hypertop/ssh-skip (one per line) are left out.
+Everything goes through ssh and its config, this machine included if it's listed, so
+that an alias means here what it means everywhere else. Aliases listed in
+~/.config/hypertop/ssh-skip (one per line) are left out.
 
 While a machine is up it is asked for its MAC address, which is remembered in
 ~/.cache/hypertop/ssh-hosts.json, so that it can still be woken once it is off and
@@ -38,6 +40,10 @@ BATCH = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 LONG = BATCH + ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
 # For peeks and actions: repeated short commands share one connection.
 SHARED = BATCH + ["-o", "ControlMaster=auto", "-o", "ControlPath=~/.cache/hypertop/cm-%C", "-o", "ControlPersist=60"]
+
+# What ssh says when it can't get to a machine at all, as opposed to getting there and
+# being turned away, which is a problem to show rather than a machine that's off.
+UNREACHABLE = re.compile(r"connection refused|timed out|no route to host|network is unreachable|host is down|could not resolve", re.I)
 
 LINUX_SAMPLER = r"""
 cpu_temp() {
@@ -283,44 +289,18 @@ def ssh_settings(alias):
     return found.get("hostname", alias), int(found.get("port", 22)), found.get("user", "")
 
 
-def own_addresses():
-    addresses = {"127.0.0.1", "::1"}
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe.connect(("192.0.2.1", 9))  # picks the outgoing address, sends nothing
-        addresses.add(probe.getsockname()[0])
-        probe.close()
-    except OSError:
-        pass
-    return addresses
-
-
 class Host:
-    def __init__(self, aliases, own):
+    def __init__(self, aliases):
         self.alias = aliases[0]
         self.aliases = aliases
         self.hostname, self.port, self.user = ssh_settings(self.alias)
-        self.local = self.hostname in own
         self.system = None
-
-    def reachable(self):
-        if self.local:
-            return True
-        try:
-            socket.create_connection((self.hostname, self.port), timeout=3).close()
-            return True
-        except OSError:
-            return False
 
     def argv(self, options, command):
         return ["ssh", *options, self.alias, command]
 
     def ask(self, command, timeout=12):
-        if self.local:
-            argv = ["sh", "-c", command]
-        else:
-            argv = self.argv(BATCH, command)
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, errors="replace")
+        return subprocess.run(self.argv(BATCH, command), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, errors="replace")
 
     def detect(self):
         """Which system this is. cmd.exe expands %OS%, and nothing else does."""
@@ -369,7 +349,7 @@ class Host:
         return self.ask(probe).returncode == 0
 
     def peek_command(self, command):
-        return ["sh", "-c", command] if self.local else self.argv(SHARED, command)
+        return self.argv(SHARED, command)
 
     def peeks(self):
         def unix(command):
@@ -408,15 +388,9 @@ class Host:
         return [{"label": label, "run": run, "every": every} for label, run, every in found]
 
     def actions(self):
-        if self.local:
-            shell = [os.environ.get("SHELL", "/bin/sh")]
-            run = ["sh", "-c", "{input}"]
-        else:
-            shell = ["ssh", self.alias]
-            run = self.argv(SHARED, "{input}")
         found = [
-            {"id": "shell", "label": "Open a shell", "run": shell, "tty": True},
-            {"id": "run", "label": "Run a command", "run": run, "input": "Command"},
+            {"id": "shell", "label": "Open a shell", "run": ["ssh", self.alias], "tty": True},
+            {"id": "run", "label": "Run a command", "run": self.argv(SHARED, "{input}"), "input": "Command"},
         ]
         power = {
             "Linux": [("reboot", "Reboot", "sudo -n reboot"), ("poweroff", "Power off", "sudo -n poweroff"), ("suspend", "Suspend", "systemctl suspend")],
@@ -451,21 +425,32 @@ class Host:
         if self.system == "Windows":
             encoded = base64.b64encode(script.encode("utf-16-le")).decode()
             return self.argv(LONG, "powershell -NoProfile -NonInteractive -EncodedCommand " + encoded), None
-        if self.local:
-            return ["sh", "-s"], script
         return self.argv(LONG, "sh -s"), script
 
     def sample_until_gone(self):
-        """Run the sampler and report what it prints, until the connection ends."""
+        """Report what the sampler prints until the connection ends. Returns what went
+        wrong, if anything did beyond the connection going, which is ordinary."""
         argv, script = self.sampler()
         if argv is None:
-            emit(id=self.alias, state="up", metrics={})
+            emit(id=self.alias, state="up", alert=None, metrics={})
             time.sleep(RETRY)
-            return
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+            return None
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        last_error = []
+
+        def read_errors():
+            for line in proc.stderr:
+                if line.strip():
+                    last_error[:] = [line.strip()]
+
+        threading.Thread(target=read_errors, daemon=True).start()
         if script:
-            proc.stdin.write(script)
-            proc.stdin.flush()
+            try:
+                proc.stdin.write(script)
+                proc.stdin.flush()
+            except OSError:
+                pass  # it has gone already, which its exit status will say
+        samples = 0
         for line in proc.stdout:
             metrics = {}
             for word in line.split():
@@ -475,24 +460,20 @@ class Host:
                 except ValueError:
                     pass
             if metrics:
+                samples += 1
                 emit(id=self.alias, state="up", alert=None, metrics=metrics)
-        proc.wait()
+        code = proc.wait()
+        if samples and code in (0, 255):
+            return None
+        return "sampler: " + (last_error[0] if last_error else f"exit {code}")
 
 
 def watch(host):
     known = load_remembered().get(host.alias, {})
     emit(id=host.alias, name=host.alias, group="computers", kind=known.get("system", "?"), state="unknown", info=host.info())
     was_off = False
+    trouble = None
     while True:
-        if not host.reachable():
-            if not was_off:
-                known = load_remembered().get(host.alias, {})
-                emit(id=host.alias, state="down", metrics={}, note=known.get("version", ""), peeks=[],
-                     actions=host.actions_while_off(known.get("mac")))
-                was_off = True
-            time.sleep(RETRY)
-            continue
-        was_off = False
         try:
             host.detect()
             version = host.version()
@@ -500,15 +481,38 @@ def watch(host):
             mac = host.mac_address()
             if mac:
                 remember(host.alias, mac=mac)
-            emit(id=host.alias, kind=host.system, note=version, state="up", alert=None,
+            # A sampler that keeps failing stays shown as failing, until a sample says otherwise.
+            emit(id=host.alias, kind=host.system, note=version, state="unknown" if trouble else "up", alert=trouble,
                  peeks=host.peeks(), actions=host.actions())
         except (OSError, subprocess.SubprocessError) as exc:
-            emit(id=host.alias, state="unknown", alert=f"ssh: {exc}", metrics={},
-                 actions=[{"id": "shell", "label": "Open a shell", "run": ["ssh", host.alias], "tty": True}])
+            if UNREACHABLE.search(str(exc)):
+                if not was_off:
+                    known = load_remembered().get(host.alias, {})
+                    emit(id=host.alias, state="down", alert=None, metrics={}, note=known.get("version", ""), peeks=[],
+                         actions=host.actions_while_off(known.get("mac")))
+                was_off = True
+            else:
+                was_off = False
+                emit(id=host.alias, state="unknown", alert=f"ssh: {exc}", metrics={},
+                     actions=[{"id": "shell", "label": "Open a shell", "run": ["ssh", host.alias], "tty": True}])
+            trouble = None
             time.sleep(RETRY)
             continue
-        host.sample_until_gone()
-        time.sleep(3)
+        was_off = False
+        trouble = host.sample_until_gone()
+        if trouble:
+            emit(id=host.alias, state="unknown", alert=trouble, metrics={})
+        time.sleep(RETRY if trouble else 3)
+
+
+def watch_forever(aliases):
+    """A surprise in here must not leave a machine looking as it last did."""
+    while True:
+        try:
+            watch(Host(aliases))
+        except Exception as exc:  # noqa: BLE001 - the edge of the thread: nothing above it would say
+            emit(id=aliases[0], name=aliases[0], group="computers", state="unknown", alert=f"ssh source: {exc}", metrics={})
+            time.sleep(RETRY)
 
 
 def main():
@@ -531,11 +535,10 @@ def main():
 
     threading.Thread(target=when_stdin_closes, daemon=True).start()
     skip = read_skip()
-    own = own_addresses()
     for aliases in read_hosts(CONFIG):
         if set(aliases) & skip:
             continue
-        threading.Thread(target=lambda a=aliases: watch(Host(a, own)), daemon=True).start()
+        threading.Thread(target=watch_forever, args=(aliases,), daemon=True).start()
     threading.Event().wait()
 
 

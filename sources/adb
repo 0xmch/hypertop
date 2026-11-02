@@ -14,6 +14,7 @@ for when adb lives on another machine, or a device needs a name or a way to wake
 
 Devices named there are connected to if adb doesn't have them, and stay listed as off
 when they don't answer. Peeking only reads. Pressing a key on a device is an action.
+`adb --run SERIAL COMMAND` runs a command on a device, quoted for however adb is reached.
 """
 import json
 import os
@@ -148,7 +149,9 @@ def base(serial, settings):
 def actions(adb, serial, settings):
     found = [
         {"id": "shell", "label": "Open a shell", "run": adb.terminal_argv(serial), "tty": True},
-        {"id": "run", "label": "Run a command", "run": adb.argv("-s", serial, "shell", "{input}"), "input": "Command"},
+        # Through here, not straight to adb: only this file knows if a shell on another
+        # machine will read what you type first, on its way to the device.
+        {"id": "run", "label": "Run a command", "run": [sys.executable, os.path.abspath(__file__), "--run", serial, "{input}"], "input": "Command"},
     ]
     if settings.get("wake"):
         found.insert(0, wake_action(settings))
@@ -159,7 +162,14 @@ def wake_action(settings):
     return {"id": "wake", "label": "Wake", "run": [os.path.expanduser(a) for a in settings["wake"]]}
 
 
+def command_argv(config, serial, command):
+    return Adb(config.get("adb") or "adb").shell_argv(serial, command)
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--run":
+        argv = command_argv(load_config(), sys.argv[2], sys.argv[3])
+        os.execvp(argv[0], argv)
     print(json.dumps({"every": EVERY}), flush=True)
     config = load_config()
     prefix = config.get("adb") or shutil.which("adb")

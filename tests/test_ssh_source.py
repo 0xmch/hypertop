@@ -53,6 +53,99 @@ class WhileOff(unittest.TestCase):
         self.assertEqual([a["id"] for a in self.host("8.8.8.8").actions_while_off("aa:bb:cc:dd:ee:ff")], ["shell"])
 
 
+class Finished(Exception):
+    """Ends a loop that would otherwise go on for ever."""
+
+
+class Trouble(unittest.TestCase):
+    def setUp(self):
+        self.said = []
+        self.original = source.emit, source.time.sleep, source.remember, source.load_remembered, source.Host
+        source.emit = lambda **fields: self.said.append(fields)
+        source.remember = lambda *_, **__: None
+        source.load_remembered = dict
+
+        def stop(_):
+            raise Finished
+
+        source.time.sleep = stop
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        source.emit, source.time.sleep, source.remember, source.load_remembered, source.Host = self.original
+
+    def sampling(self, script):
+        host = source.Host.__new__(source.Host)
+        host.alias = "box"
+        host.sampler = lambda: (["sh", "-c", script], None)
+        return host.sample_until_gone()
+
+    def test_a_connection_that_goes_after_samples_is_ordinary(self):
+        self.assertIsNone(self.sampling("echo cpu=1; exit 255"))
+        self.assertEqual(self.said, [{"id": "box", "state": "up", "alert": None, "metrics": {"cpu": 1.0}}])
+
+    def test_a_sampler_that_fails_says_why(self):
+        self.assertEqual(self.sampling("echo nope >&2; exit 7"), "sampler: nope")
+        self.assertEqual(self.sampling("exit 7"), "sampler: exit 7")
+        self.assertEqual(self.sampling("echo cpu=1; exit 7"), "sampler: exit 7")
+
+    def test_a_sampler_that_never_samples_is_a_failure_even_if_it_ends_well(self):
+        self.assertEqual(self.sampling("exit 0"), "sampler: exit 0")
+
+    class FakeHost:
+        alias = "box"
+
+        def __init__(self, problem):
+            self.problem = problem
+
+        def info(self):
+            return {}
+
+        def detect(self):
+            raise OSError(self.problem)
+
+        def actions_while_off(self, _):
+            return []
+
+    def watching(self, problem):
+        with self.assertRaises(Finished):
+            source.watch(self.FakeHost(problem))
+        return self.said[-1]
+
+    def test_what_ssh_cannot_reach_is_off(self):
+        for problem in ("ssh: connect to host x port 22: Connection refused", "ssh: connect to host x port 22: Operation timed out",
+                        "ssh: Could not resolve hostname x: nodename nor servname provided"):
+            said = self.watching(problem)
+            self.assertEqual(said["state"], "down", problem)
+            self.assertIsNone(said["alert"])
+
+    def test_being_turned_away_is_a_problem_and_not_a_machine_that_is_off(self):
+        said = self.watching("someone@x: Permission denied (publickey).")
+        self.assertEqual(said["state"], "unknown")
+        self.assertIn("Permission denied", said["alert"])
+
+    def test_a_surprise_shows_instead_of_leaving_the_last_state(self):
+        def broken(_):
+            raise RuntimeError("surprise")
+
+        source.Host = broken
+        with self.assertRaises(Finished):
+            source.watch_forever(["box"])
+        self.assertEqual(self.said[-1]["state"], "unknown")
+        self.assertIn("surprise", self.said[-1]["alert"])
+
+
+class Destinations(unittest.TestCase):
+    def test_everything_goes_through_the_alias_wherever_it_points(self):
+        host = source.Host.__new__(source.Host)
+        host.alias, host.hostname, host.port, host.system = "tunnel", "127.0.0.1", 2222, "Linux"
+        actions = {a["id"]: a["run"] for a in host.actions()}
+        self.assertEqual(actions["shell"], ["ssh", "tunnel"])
+        self.assertEqual(actions["run"][0], "ssh")
+        self.assertIn("tunnel", actions["run"])
+        self.assertEqual(host.sampler()[0][0], "ssh")
+
+
 class ReadHosts(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

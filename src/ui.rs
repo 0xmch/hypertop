@@ -63,8 +63,7 @@ pub fn duration(seconds: f64) -> String {
     }
 }
 
-fn sparkline(history: Option<&std::collections::VecDeque<f32>>, width: usize) -> String {
-    let Some(history) = history else { return " ".repeat(width) };
+fn sparkline(history: &std::collections::VecDeque<f32>, width: usize) -> String {
     let shown: Vec<f32> = history.iter().rev().take(width).rev().copied().collect();
     let mut out = " ".repeat(width - shown.len());
     out.extend(shown.iter().map(|v| SPARK[((v / 100.0).clamp(0.0, 1.0) * 7.0).round() as usize]));
@@ -153,7 +152,7 @@ fn device_line(device: &Device, chosen: &[usize], spark: bool, width: usize) -> 
     for &i in chosen {
         let (metric, _, format, column) = COLUMNS[i];
         if metric == "cpu" && spark {
-            spans.push(Span::styled(format!("{} ", sparkline(device.history.get("cpu"), SPARK_WIDTH)), Style::new().fg(Color::Blue)));
+            spans.push(Span::styled(format!("{} ", sparkline(&device.cpu_history, SPARK_WIDTH)), Style::new().fg(Color::Blue)));
             used += SPARK_WIDTH + 1;
         }
         match device.metrics.get(metric) {
@@ -346,7 +345,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         let label = device.peeks.get(app.tab - 1).map(|p| p.label.clone()).unwrap_or_default();
         match app.peeks.get(&(device.key.clone(), label)) {
-            Some(state) if state.ran.is_some() => state.text.lines().skip(scroll).take(height).map(|l| Line::raw(l.to_string())).collect(),
+            Some(state) => state.text.lines().skip(scroll).take(height).map(|l| Line::raw(l.to_string())).collect(),
             _ => vec![Line::from(Span::styled("asking…", DIM))],
         }
     };
@@ -402,18 +401,14 @@ fn popup(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str) ->
     inner
 }
 
-fn target_summary(app: &App) -> String {
-    let tagged = app.model.devices.iter().filter(|d| d.tagged).count();
-    if tagged > 0 {
-        return format!("{tagged} tagged devices");
-    }
-    app.selected.as_ref().and_then(|k| app.model.get(k)).map_or(String::new(), |d| d.name.clone())
-}
-
 fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
-    let Mode::Menu { items, at } = &app.mode else { return };
-    let inner = popup(frame, area, 54, items.len() as u16 + 4, &format!("act on {}", target_summary(app)));
-    let total = app.model.devices.iter().filter(|d| d.tagged).count();
+    let Mode::Menu { items, at, targets } = &app.mode else { return };
+    let total = targets.len();
+    let who = match targets.as_slice() {
+        [key] => app.model.get(key).map_or(key.clone(), |d| d.name.clone()),
+        _ => format!("{total} devices"),
+    };
+    let inner = popup(frame, area, 54, items.len() as u16 + 4, &format!("act on {who}"));
     let mut lines = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let mut label = item.label.clone();
@@ -442,8 +437,8 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    let Mode::Input { prompt, text, .. } = &app.mode else { return };
-    let inner = popup(frame, area, 70, 6, &format!("{prompt}, on {}", target_summary(app)));
+    let Mode::Input { plan, text } = &app.mode else { return };
+    let inner = popup(frame, area, 70, 6, &format!("{}, on {}", plan.prompt.as_deref().unwrap_or("Input"), plan.who()));
     let lines = vec![
         Line::from(vec![Span::styled("> ", KEY), Span::raw(text.clone()), Span::styled("█", KEY)]),
         Line::raw(""),
@@ -453,21 +448,21 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let Mode::Confirm { names, label, input, .. } = &app.mode else { return };
-    let inner = popup(frame, area, 64, (names.len() as u16).min(10) + 6, "are you sure?");
+    let Mode::Confirm { plan, input } = &app.mode else { return };
+    let inner = popup(frame, area, 64, (plan.steps.len() as u16).min(10) + 6, "are you sure?");
     let what = match input {
-        Some(text) => format!("{label}: {text}"),
-        None => label.clone(),
+        Some(text) => format!("{}: {text}", plan.label),
+        None => plan.label.clone(),
     };
     let mut lines = vec![Line::from(Span::styled(what, BOLD)), Line::raw("on:")];
-    for name in names.iter().take(8) {
+    for (name, _) in plan.steps.iter().take(8) {
         lines.push(Line::raw(format!("  {name}")));
     }
-    if names.len() > 8 {
-        lines.push(Line::raw(format!("  and {} more", names.len() - 8)));
+    if plan.steps.len() > 8 {
+        lines.push(Line::raw(format!("  and {} more", plan.steps.len() - 8)));
     }
     lines.push(Line::raw(""));
-    let key = if names.len() > 1 { "Y" } else { "y" };
+    let key = if plan.steps.len() > 1 { "Y" } else { "y" };
     lines.push(Line::from(vec![
         Span::styled(key, Style::new().fg(Color::Black).bg(Color::Yellow)),
         Span::raw(" yes   "),
@@ -572,8 +567,8 @@ mod tests {
     #[test]
     fn sparkline_fills_from_the_right_and_stays_in_range() {
         let history = VecDeque::from([0.0, 100.0, 500.0, -5.0]);
-        assert_eq!(sparkline(Some(&history), 6), "  ▁██▁");
-        assert_eq!(sparkline(None, 3), "   ");
+        assert_eq!(sparkline(&history, 6), "  ▁██▁");
+        assert_eq!(sparkline(&VecDeque::new(), 3), "   ");
     }
 
     #[test]

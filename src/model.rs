@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-const HISTORY: usize = 60;
+/// As much as the graph on screen shows.
+const HISTORY: usize = 12;
 /// Numbers worth interrupting for, whatever the device.
 const LIMITS: [(&str, f64, &str); 4] =
     [("disk", 90.0, "disk"), ("mem", 95.0, "memory"), ("temp", 85.0, "temperature"), ("gputemp", 85.0, "GPU temperature")];
@@ -51,7 +52,7 @@ pub struct Device {
     pub alert: Option<String>,
     pub metrics: BTreeMap<String, f64>,
     pub info: BTreeMap<String, String>,
-    pub history: BTreeMap<String, VecDeque<f32>>,
+    pub cpu_history: VecDeque<f32>,
     pub peeks: Vec<Peek>,
     pub actions: Vec<Action>,
     pub tagged: bool,
@@ -85,7 +86,7 @@ impl Device {
             alert: None,
             metrics: BTreeMap::new(),
             info: BTreeMap::new(),
-            history: BTreeMap::new(),
+            cpu_history: VecDeque::new(),
             peeks: Vec::new(),
             actions: Vec::new(),
             tagged: false,
@@ -123,10 +124,11 @@ impl Device {
             for (name, value) in metrics {
                 if let Some(number) = value.as_f64() {
                     self.metrics.insert(name.clone(), number);
-                    let history = self.history.entry(name.clone()).or_default();
-                    history.push_back(number as f32);
-                    if history.len() > HISTORY {
-                        history.pop_front();
+                    if name == "cpu" {
+                        self.cpu_history.push_back(number as f32);
+                        if self.cpu_history.len() > HISTORY {
+                            self.cpu_history.pop_front();
+                        }
                     }
                 }
             }
@@ -267,18 +269,24 @@ impl Model {
     /// source failing must never look like its devices being fine.
     pub fn source_exited(&mut self, source: &str, success: bool, why: &str) {
         let seen = self.seen_this_run.remove(source).unwrap_or_default();
-        let failed_key = format!("{source}/{SOURCE_FAILED}");
         if success {
             self.devices.retain(|d| d.source != source || seen.contains(&d.id));
+            self.reindex();
         } else {
-            self.devices.retain(|d| d.key != failed_key);
-            let mut device = Device::new(source, SOURCE_FAILED);
-            device.name = source.to_string();
-            device.group = "sources".to_string();
-            device.kind = "source".to_string();
-            device.alert = Some(if why.is_empty() { "failed".to_string() } else { why.to_string() });
-            self.devices.push(device);
+            self.source_trouble(source, why);
         }
+    }
+
+    /// A row of its own that says what's wrong with a source, until its next good run.
+    pub fn source_trouble(&mut self, source: &str, why: &str) {
+        let failed_key = format!("{source}/{SOURCE_FAILED}");
+        self.devices.retain(|d| d.key != failed_key);
+        let mut device = Device::new(source, SOURCE_FAILED);
+        device.name = source.to_string();
+        device.group = "sources".to_string();
+        device.kind = "source".to_string();
+        device.alert = Some(if why.is_empty() { "failed".to_string() } else { why.to_string() });
+        self.devices.push(device);
         self.reindex();
     }
 
@@ -332,7 +340,28 @@ mod tests {
         assert_eq!(d.state, State::Up);
         assert_eq!(d.group, "g1");
         assert_eq!(d.metrics["cpu"], 20.0);
-        assert_eq!(d.history["cpu"], VecDeque::from([10.0, 20.0]));
+        assert_eq!(d.cpu_history, VecDeque::from([10.0, 20.0]));
+    }
+
+    #[test]
+    fn only_as_much_history_as_is_shown_is_kept() {
+        let mut m = Model::default();
+        for i in 0..100 {
+            m.line("s", &json!({"id": "x", "metrics": {"cpu": i, "mem": i}}));
+        }
+        assert_eq!(m.get("s/x").unwrap().cpu_history.len(), HISTORY);
+    }
+
+    #[test]
+    fn trouble_from_a_running_source_shows_and_a_good_run_clears_it() {
+        let mut m = model();
+        m.source_trouble("s", "printed nonsense");
+        assert_eq!(m.get("s/!").unwrap().attention().as_deref(), Some("printed nonsense"));
+        assert!(m.get("s/a").is_some(), "its devices stay");
+        m.line("s", &json!({"id": "a"}));
+        m.line("s", &json!({"id": "b"}));
+        m.source_exited("s", true, "");
+        assert!(m.get("s/!").is_none());
     }
 
     #[test]

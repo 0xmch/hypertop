@@ -12,7 +12,10 @@ if not os.path.exists(mixer):
     sys.exit(0)  # no pcmlink here: no devices, and nothing wrong
 sockets = os.environ.get("PCMLINK_RX_DIR") or os.path.expanduser("~/Library/Application Support/pcmlink/rx")
 print(json.dumps({"every": 10}), flush=True)
-clients = json.loads(subprocess.run([mixer, "--json"], capture_output=True, text=True, timeout=10).stdout or "[]")
+done = subprocess.run([mixer, "--json"], capture_output=True, text=True, timeout=10, check=False)
+if done.returncode != 0:
+    sys.exit((done.stderr.strip().splitlines() or [f"pcmlink-mixer: exit {done.returncode}"])[-1])
+clients = json.loads(done.stdout)
 
 
 def say(line, socket):

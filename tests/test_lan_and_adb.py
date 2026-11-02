@@ -111,5 +111,36 @@ class AdbParsing(unittest.TestCase):
         self.assertEqual(local.shell_argv("s", "a b"), ["adb", "-s", "s", "shell", "a b"])
 
 
+class AdbCommands(unittest.TestCase):
+    def test_what_you_type_goes_through_the_source_and_not_straight_to_adb(self):
+        found = adb.actions(adb.Adb("ssh -T box .local/bin/adb"), "s", {})
+        run = next(a for a in found if a["id"] == "run")["run"]
+        self.assertEqual(run[-3:], ["--run", "s", "{input}"])
+        self.assertNotIn("ssh", run)
+
+    def test_through_ssh_all_of_it_reaches_the_device(self):
+        argv = adb.command_argv({"adb": "ssh -T box .local/bin/adb"}, "s", "echo ok; id")
+        self.assertEqual(argv, ["ssh", "-T", "box", ".local/bin/adb", "-s", "s", "shell", "'echo ok; id'"])
+
+    def test_with_adb_here_nothing_else_reads_it(self):
+        self.assertEqual(adb.command_argv({}, "s", "echo ok; id"), ["adb", "-s", "s", "shell", "echo ok; id"])
+
+
+class PcmlinkFailure(unittest.TestCase):
+    def test_a_mixer_that_fails_is_a_failed_source_and_not_an_empty_one(self):
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as directory:
+            mixer = os.path.join(directory, "pcmlink-mixer")
+            with open(mixer, "w") as fh:
+                fh.write("#!/bin/sh\necho no sockets here >&2\nexit 3\n")
+            os.chmod(mixer, 0o755)
+            done = subprocess.run([sys.executable, os.path.join(HERE, "sources", "pcmlink")], capture_output=True, text=True, check=False,
+                                  env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no sockets here", done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

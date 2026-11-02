@@ -43,11 +43,13 @@ own pace. A peek tab runs its command only while it is on screen, and only once 
 have stopped on that device, so moving through the list asks nothing of what you pass.
 
 **Acting scales.** Tag devices with space (`t` tags everything shown, so filter and then
-`t` tags a whole class), then press Enter for actions or `!` for a command. Each device
-runs it at once and reports back on its own, so one failure doesn't hide among the rest.
+`t` tags a whole class), then press Enter for actions or `!` for a command. It goes to
+everything tagged, shown or not, as the title counts them. Each device runs it at once and
+reports back on its own, so one failure doesn't hide among the rest.
 
 **Actions ask when they should.** A source marks what needs confirming. One device takes
-`y`; several take a capital `Y`, because a stray key must not switch off a room.
+`y`; several take a capital `Y`, because a stray key must not switch off a room. What runs
+is what you confirmed, even if the list changes while you're being asked.
 
 ## Keys
 
@@ -93,8 +95,9 @@ source can describe a device once and then send only its numbers.
   (°C), `watts`, `uptime` (seconds). Any other name shows in the overview. A column
   appears when some device has that number.
 - **Attention**: `disk` from 90, `mem` from 95, and `temp` or `gputemp` from 85 flag a
-  device by themselves, while it is up. So does a source that fails, in a row of its own,
-  so a broken source never looks like its devices being fine.
+  device by themselves, while it is up. So does a source that fails or prints something
+  that isn't JSON, in a row of its own that keeps its devices listed, so a broken source
+  never looks like its devices being fine.
 - **Actions** match across devices by `id`: tag ten machines, and "Run a command" runs on
   all of them. `tty` actions take over the terminal and so work on one device at a time.
   `{input}` is replaced by what you type.
@@ -112,13 +115,15 @@ Link the ones you want into `~/.config/hypertop/sources/`.
   the connection. Linux, macOS and Windows; on Windows it runs below normal priority, so
   it stays out of a game's way. Temperature comes from the sensors on Linux and from the
   die sensors on a Mac, with no sudo, if Homebrew's Python is there.
-  While a machine is up it is asked for its MAC address, which is remembered so that it
-  can be woken with a magic packet once it is off. A machine shown as off is one whose ssh
-  port doesn't answer: it may well be on, with ssh closed.
-- **`sources/lan`**: whatever else answers a ping on this machine's subnet, leaving out what
-  `ssh` covers. It only ever looks at a private subnet of at most 254 addresses. Names come
-  from `~/.config/hypertop/lan-names` (an address or MAC, then a name; `-` hides it), then
-  multicast DNS, then reverse DNS.
+  Everything goes through `ssh`, so `ProxyJump` and the like work, and this machine needs
+  its own ssh server if it's listed. While a machine is up it is asked for its MAC address,
+  which is remembered so that it can be woken with a magic packet once it is off. A machine
+  shown as off is one ssh can't reach: it may well be on, with ssh closed.
+- **`sources/lan`**: whatever answers a ping on this machine's subnet. It only ever looks at
+  a private subnet of at most 254 addresses. Names come from
+  `~/.config/hypertop/lan-names` (an address or MAC, then a name; `-` hides it), then
+  multicast DNS, then reverse DNS. Give a machine `-` there if another source already
+  shows it.
 - **`sources/adb`**: every Android device adb can see, phones and TVs alike: awake or
   asleep, what is in front, battery. `~/.config/hypertop/adb.json` is optional, for adb on
   another machine, or to name a device and say how to wake it; see the top of the file.

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -29,6 +29,11 @@ const CLOCK: Duration = Duration::from_secs(1);
 /// A peek starts once the selection has stayed put this long, so that passing over
 /// a device doesn't ask it anything.
 const SETTLE: Duration = Duration::from_millis(150);
+/// Messages that can wait for the main loop, which is busy elsewhere during a shell.
+/// When it's full, what produces them waits instead.
+const BACKLOG: usize = 4096;
+/// How many it takes in one go, so that a flood can't keep input waiting.
+const PUMP_LIMIT: usize = 2000;
 const NOTICE: Duration = Duration::from_secs(6);
 const PAGE: i32 = 10;
 
@@ -90,20 +95,50 @@ pub struct MenuItem {
     pub count: usize,
 }
 
+/// An action, decided: what runs, and where. It is made when you ask, and carried through
+/// any question it needs, so what you confirmed is what happens, whatever the sources
+/// say and wherever the selection goes in the meantime.
+pub struct Plan {
+    pub label: String,
+    pub prompt: Option<String>,
+    pub confirm: bool,
+    pub tty: bool,
+    /// Each device's name and its own action.
+    pub steps: Vec<(String, Action)>,
+}
+
+impl Plan {
+    /// What it applies to, in a few words.
+    pub fn who(&self) -> String {
+        match self.steps.as_slice() {
+            [(name, _)] => name.clone(),
+            steps => format!("{} devices", steps.len()),
+        }
+    }
+}
+
 pub enum Mode {
     Normal,
     Filter,
-    Menu { items: Vec<MenuItem>, at: usize },
-    Input { id: String, prompt: String, text: String },
-    Confirm { id: String, input: Option<String>, names: Vec<String>, label: String },
+    Menu { items: Vec<MenuItem>, at: usize, targets: Vec<String> },
+    Input { plan: Plan, text: String },
+    Confirm { plan: Plan, input: Option<String> },
     Jobs { scroll: u16 },
     Help,
 }
 
 pub struct PeekState {
     pub text: String,
-    pub ran: Option<Instant>,
-    pub running: bool,
+    ran: Instant,
+    run: Vec<String>,
+}
+
+/// The peek being run. There is one at most: the one on screen.
+struct ActivePeek {
+    generation: u64,
+    key: String,
+    label: String,
+    stop: run::Stop,
 }
 
 pub struct App {
@@ -124,7 +159,11 @@ pub struct App {
     pub jobs: Vec<Job>,
     pub notice: Option<(String, Instant)>,
     pub peeks: HashMap<(String, String), PeekState>,
+    active_peek: Option<ActivePeek>,
+    generation: u64,
     moved: Instant,
+    /// The last pump left messages waiting.
+    behind: bool,
     /// What's listed, worked out again only when the model or the view changes.
     pub rows: Vec<Row>,
     /// Where the rows landed on screen, for the mouse.
@@ -134,13 +173,13 @@ pub struct App {
     tty_request: Option<Vec<String>>,
     wakes: Vec<Sender<()>>,
     running: Running,
-    tx: Sender<Msg>,
+    tx: SyncSender<Msg>,
     rx: Receiver<Msg>,
 }
 
 impl App {
     fn new(opts: &Opts) -> App {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(BACKLOG);
         let running = Running::default();
         let found = run::find_sources(&opts.dir);
         let sources = found.len();
@@ -160,7 +199,10 @@ impl App {
             jobs: Vec::new(),
             notice: None,
             peeks: HashMap::new(),
+            active_peek: None,
+            generation: 0,
             moved: Instant::now(),
+            behind: false,
             rows: Vec::new(),
             list_area: Default::default(),
             sources,
@@ -198,28 +240,38 @@ impl App {
                 self.moved = Instant::now();
             }
         }
+        let model = &self.model;
+        self.peeks.retain(|(key, _), _| model.get(key).is_some());
     }
 
     /// Take in what happened in the background. True if the screen may have to change.
     fn pump(&mut self) -> bool {
         let mut changed = false;
         let mut devices_changed = false;
-        while let Ok(message) = self.rx.try_recv() {
+        let mut taken = 0;
+        while taken < PUMP_LIMIT {
+            let Ok(message) = self.rx.try_recv() else { break };
+            taken += 1;
             changed = true;
             match message {
                 Msg::Line { source, line } => {
                     self.model.line(&source, &line);
                     devices_changed = true;
                 }
+                Msg::Trouble { source, why } => {
+                    self.model.source_trouble(&source, &why);
+                    devices_changed = true;
+                }
                 Msg::Exited { source, success, why } => {
                     self.model.source_exited(&source, success, &why);
                     devices_changed = true;
                 }
-                Msg::Peek { key, label, text } => {
-                    let state = self.peeks.entry((key, label)).or_insert(PeekState { text: String::new(), ran: None, running: false });
-                    state.text = text;
-                    state.running = false;
-                    state.ran = Some(Instant::now());
+                Msg::Peek { generation, key, label, run, text } => {
+                    // The answer to a peek you have looked away from isn't wanted.
+                    if self.active_peek.as_ref().is_some_and(|a| a.generation == generation) {
+                        self.active_peek = None;
+                        self.peeks.insert((key, label), PeekState { text, ran: Instant::now(), run });
+                    }
                 }
                 Msg::JobOutput { job, text } => {
                     if let Some(job) = self.jobs.get_mut(job) {
@@ -230,6 +282,7 @@ impl App {
                 Msg::JobDone { job, outcome } => self.job_done(job, outcome),
             }
         }
+        self.behind = taken == PUMP_LIMIT;
         if devices_changed {
             self.refresh_rows();
         }
@@ -253,20 +306,46 @@ impl App {
         self.say(line);
     }
 
-    /// Peeks run only for the tab on screen, and stop when you look away: nothing
-    /// is asked of a device unless someone is reading the answer.
+    /// The peek you can see right now, if any.
+    fn peek_on_screen(&self) -> Option<(String, model::Peek)> {
+        if !self.detail_open || self.tab == 0 || matches!(self.mode, Mode::Jobs { .. }) {
+            return None;
+        }
+        let key = self.selected.clone()?;
+        let peek = self.model.get(&key)?.peeks.get(self.tab - 1)?.clone();
+        Some((key, peek))
+    }
+
+    /// Peeks run only for the tab on screen, and stop when you look away: nothing is
+    /// asked of a device unless someone is reading the answer.
     fn run_visible_peek(&mut self) {
-        if !self.detail_open || self.tab == 0 || self.moved.elapsed() < SETTLE {
+        let wanted = self.peek_on_screen();
+        if let Some(active) = &self.active_peek {
+            if wanted.as_ref().is_some_and(|(key, peek)| *key == active.key && peek.label == active.label) {
+                return;
+            }
+            active.stop.now();
+            self.active_peek = None;
+        }
+        let Some((key, peek)) = wanted else { return };
+        if self.moved.elapsed() < SETTLE {
             return;
         }
-        let Some(key) = self.selected.clone() else { return };
-        let Some(peek) = self.model.get(&key).and_then(|d| d.peeks.get(self.tab - 1)).cloned() else { return };
-        let state = self.peeks.entry((key.clone(), peek.label.clone())).or_insert(PeekState { text: String::new(), ran: None, running: false });
-        if state.running || state.ran.is_some_and(|at| at.elapsed() < Duration::from_secs(peek.every)) {
+        let known = self.peeks.get(&(key.clone(), peek.label.clone()));
+        if known.is_some_and(|state| state.run == peek.run && state.ran.elapsed() < Duration::from_secs(peek.every)) {
             return;
         }
-        state.running = true;
-        run::spawn_peek(key, peek.label, peek.run, self.tx.clone());
+        self.generation += 1;
+        let stop = run::spawn_peek(self.generation, key.clone(), peek.label.clone(), peek.run, self.tx.clone());
+        self.active_peek = Some(ActivePeek { generation: self.generation, key, label: peek.label, stop });
+    }
+
+    /// Everything that would otherwise outlive this program.
+    fn stop_all(&self) {
+        self.running.stop_all();
+        if let Some(active) = &self.active_peek {
+            active.stop.now();
+        }
     }
 
     fn move_selection(&mut self, by: i32) {
@@ -304,9 +383,10 @@ impl App {
         }
     }
 
-    /// What an action applies to: everything tagged, or else the selected device.
+    /// What an action applies to: everything tagged, shown or not, as the title counts
+    /// them, or else the selected device.
     fn targets(&self) -> Vec<String> {
-        let tagged: Vec<String> = self.device_keys().filter(|k| self.model.get(k).is_some_and(|d| d.tagged)).cloned().collect();
+        let tagged: Vec<String> = self.model.devices.iter().filter(|d| d.tagged).map(|d| d.key.clone()).collect();
         if !tagged.is_empty() {
             return tagged;
         }
@@ -334,58 +414,57 @@ impl App {
         if items.is_empty() {
             self.say("no actions here");
         } else {
-            self.mode = Mode::Menu { items, at: 0 };
+            self.mode = Mode::Menu { items, at: 0, targets };
         }
     }
 
-    fn with_action<'a>(&'a self, id: &str) -> Vec<(&'a str, &'a Action)> {
-        self.targets()
+    /// One action on these devices, with whatever any of them needs: one that asks first
+    /// or takes a line of text decides for the batch, whichever order they come in.
+    fn plan(&self, id: &str, keys: &[String]) -> Option<Plan> {
+        let steps: Vec<(String, Action)> = keys
             .iter()
             .filter_map(|key| {
                 let device = self.model.get(key)?;
-                Some((device.name.as_str(), device.actions.iter().find(|a| a.id == id)?))
+                Some((device.name.clone(), device.actions.iter().find(|a| a.id == id)?.clone()))
             })
-            .collect()
+            .collect();
+        Some(Plan {
+            label: steps.first()?.1.label.clone(),
+            prompt: steps.iter().find_map(|(_, a)| a.input.clone()),
+            confirm: steps.iter().any(|(_, a)| a.confirm),
+            tty: steps.iter().any(|(_, a)| a.tty),
+            steps,
+        })
     }
 
     /// Start an action, stopping first for whatever it needs from you.
-    fn begin(&mut self, id: &str) {
-        let plan = self.with_action(id);
-        let Some((_, first)) = plan.first() else {
-            self.mode = Mode::Normal;
+    fn begin(&mut self, id: &str, keys: &[String]) {
+        self.mode = Mode::Normal;
+        let Some(plan) = self.plan(id, keys) else {
             self.say(format!("nothing selected can do {id}"));
             return;
         };
-        let (tty, input, label) = (first.tty, first.input.clone(), first.label.clone());
-        let count = plan.len();
-        if tty && count > 1 {
-            self.mode = Mode::Normal;
-            self.say(format!("{label} takes over the terminal, so it works on one device at a time"));
+        if plan.tty && plan.steps.len() > 1 {
+            self.say(format!("{} takes over the terminal, so it works on one device at a time", plan.label));
             return;
         }
-        if let Some(prompt) = input {
-            self.mode = Mode::Input { id: id.to_string(), prompt, text: String::new() };
+        if plan.prompt.is_some() {
+            self.mode = Mode::Input { plan, text: String::new() };
             return;
         }
-        self.confirm_or_launch(id, None);
+        self.confirm_or_launch(plan, None);
     }
 
-    fn confirm_or_launch(&mut self, id: &str, input: Option<String>) {
-        let plan = self.with_action(id);
-        let names: Vec<String> = plan.iter().map(|(name, _)| name.to_string()).collect();
-        let needs_confirm = plan.iter().any(|(_, action)| action.confirm);
-        let label = plan.first().map_or(id.to_string(), |(_, a)| a.label.clone());
-        if needs_confirm {
-            self.mode = Mode::Confirm { id: id.to_string(), input, names, label };
+    fn confirm_or_launch(&mut self, plan: Plan, input: Option<String>) {
+        if plan.confirm {
+            self.mode = Mode::Confirm { plan, input };
         } else {
-            self.launch(id, input);
+            self.launch(plan, input);
         }
     }
 
-    fn launch(&mut self, id: &str, input: Option<String>) {
-        let planned: Vec<(String, Action)> = self.with_action(id).into_iter().map(|(n, a)| (n.to_string(), a.clone())).collect();
+    fn launch(&mut self, plan: Plan, input: Option<String>) {
         self.mode = Mode::Normal;
-        let Some((_, first)) = planned.first() else { return };
         let fill = |argv: &[String]| -> Vec<String> {
             argv.iter()
                 .map(|arg| match &input {
@@ -394,12 +473,12 @@ impl App {
                 })
                 .collect()
         };
-        if first.tty {
-            self.tty_request = Some(fill(&first.run));
+        if plan.tty {
+            self.tty_request = plan.steps.first().map(|(_, action)| fill(&action.run));
             return;
         }
-        let show = planned.len() > 1 || input.is_some();
-        for (device, action) in &planned {
+        let show = plan.steps.len() > 1 || input.is_some();
+        for (device, action) in &plan.steps {
             let job = self.jobs.len();
             let label = match &input {
                 Some(text) => format!("{}: {text}", action.label),
@@ -417,9 +496,9 @@ impl App {
         }
         // Scroll to where this batch starts.
         if show {
-            self.mode = Mode::Jobs { scroll: ui::jobs_line_of(&self.jobs, self.jobs.len() - planned.len()) };
+            self.mode = Mode::Jobs { scroll: ui::jobs_line_of(&self.jobs, self.jobs.len() - plan.steps.len()) };
         } else {
-            self.say(format!("{} on {}…", first.label, planned[0].0));
+            self.say(format!("{} on {}…", plan.label, plan.who()));
         }
     }
 
@@ -434,9 +513,9 @@ impl App {
             Mode::Normal => return self.key_normal(key),
             Mode::Filter => self.key_filter(key),
             Mode::Help => {}
-            Mode::Menu { items, at } => self.key_menu(key, items, at),
-            Mode::Input { id, prompt, text } => self.key_input(key, id, prompt, text),
-            Mode::Confirm { id, input, names, label } => self.key_confirm(key, id, input, names, label),
+            Mode::Menu { items, at, targets } => self.key_menu(key, items, at, targets),
+            Mode::Input { plan, text } => self.key_input(key, plan, text),
+            Mode::Confirm { plan, input } => self.key_confirm(key, plan, input),
             Mode::Jobs { scroll } => self.key_jobs(key, scroll),
         }
         true
@@ -485,23 +564,20 @@ impl App {
             KeyCode::Char('K') => self.detail_scroll = self.detail_scroll.saturating_sub(3),
             KeyCode::Enter | KeyCode::Char('x') => self.open_menu(),
             KeyCode::Char('s') => {
-                let shell = self.selected.as_ref().and_then(|k| self.model.get(k)).and_then(|d| d.actions.iter().find(|a| a.tty)).map(|a| a.id.clone());
-                match shell {
+                // A shell is for the device under the cursor, tagged or not.
+                let device = self.selected.as_ref().and_then(|k| self.model.get(k));
+                match device.and_then(|d| d.actions.iter().find(|a| a.tty)).map(|a| a.id.clone()) {
                     Some(id) => {
-                        // A shell is for the device under the cursor, tagged or not.
-                        let tagged: Vec<String> = self.model.devices.iter().filter(|d| d.tagged).map(|d| d.key.clone()).collect();
-                        self.model.devices.iter_mut().for_each(|d| d.tagged = false);
-                        self.begin(&id);
-                        for key in tagged {
-                            if let Some(device) = self.model.get_mut(&key) {
-                                device.tagged = true;
-                            }
-                        }
+                        let here: Vec<String> = self.selected.iter().cloned().collect();
+                        self.begin(&id, &here);
                     }
                     None => self.say("this device has no shell"),
                 }
             }
-            KeyCode::Char('!') => self.begin("run"),
+            KeyCode::Char('!') => {
+                let targets = self.targets();
+                self.begin("run", &targets);
+            }
             KeyCode::Char('o') => self.mode = Mode::Jobs { scroll: ui::jobs_line_of(&self.jobs, self.jobs.len().saturating_sub(8)) },
             KeyCode::Char('b') => {
                 self.group_by = match self.group_by {
@@ -553,7 +629,7 @@ impl App {
         self.refresh_rows();
     }
 
-    fn key_menu(&mut self, key: KeyEvent, items: Vec<MenuItem>, at: usize) {
+    fn key_menu(&mut self, key: KeyEvent, items: Vec<MenuItem>, at: usize, targets: Vec<String>) {
         let mut at = at;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return,
@@ -561,29 +637,29 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => at = (at + 1).min(items.len() - 1),
             KeyCode::Enter => {
                 let id = items[at].id.clone();
-                self.begin(&id);
+                self.begin(&id, &targets);
                 return;
             }
             KeyCode::Char(c) => {
                 if let Some(n) = c.to_digit(10) {
                     if n >= 1 && (n as usize) <= items.len() {
                         let id = items[n as usize - 1].id.clone();
-                        self.begin(&id);
+                        self.begin(&id, &targets);
                         return;
                     }
                 }
             }
             _ => {}
         }
-        self.mode = Mode::Menu { items, at };
+        self.mode = Mode::Menu { items, at, targets };
     }
 
-    fn key_input(&mut self, key: KeyEvent, id: String, prompt: String, mut text: String) {
+    fn key_input(&mut self, key: KeyEvent, plan: Plan, mut text: String) {
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Enter => {
                 if !text.trim().is_empty() {
-                    self.confirm_or_launch(&id, Some(text));
+                    self.confirm_or_launch(plan, Some(text));
                 }
                 return;
             }
@@ -593,18 +669,17 @@ impl App {
             KeyCode::Char(c) => text.push(c),
             _ => {}
         }
-        self.mode = Mode::Input { id, prompt, text };
+        self.mode = Mode::Input { plan, text };
     }
 
     /// One device: y. Several: capital Y, because a stray y must not switch off a
     /// whole room.
-    fn key_confirm(&mut self, key: KeyEvent, id: String, input: Option<String>, names: Vec<String>, label: String) {
-        let wanted = if names.len() > 1 { 'Y' } else { 'y' };
+    fn key_confirm(&mut self, key: KeyEvent, plan: Plan, input: Option<String>) {
+        let wanted = if plan.steps.len() > 1 { 'Y' } else { 'y' };
         if key.code == KeyCode::Char(wanted) {
-            self.launch(&id, input);
+            self.launch(plan, input);
         } else {
-            self.say(format!("{label}: cancelled"));
-            let _ = (names, input);
+            self.say(format!("{}: cancelled", plan.label));
         }
     }
 
@@ -712,13 +787,14 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
             dirty = true;
             continue;
         }
-        match take_input(&mut app, FRAME) {
+        let wait = if app.behind { Duration::ZERO } else { FRAME };
+        match take_input(&mut app, wait) {
             Ok(Some(input)) => dirty |= input,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
         }
     };
-    app.running.stop_all();
+    app.stop_all();
     let _ = mouse_capture(false);
     ratatui::restore();
     result
@@ -728,9 +804,11 @@ fn print_list(app: &App) {
     if app.sources == 0 {
         println!("no sources in {}", app.dir.display());
     }
+    // Nothing on the way to a terminal here strips what a source sent, as drawing does.
+    let plain = |text: &str| run::clean(text).replace('\n', " ");
     for row in &app.rows {
         match row {
-            Row::Header { title, up, total } => println!("{title} ({up}/{total} up)"),
+            Row::Header { title, up, total } => println!("{} ({up}/{total} up)", plain(title)),
             Row::Device(key) => {
                 let Some(d) = app.model.get(key) else { continue };
                 let state = match d.state {
@@ -739,9 +817,9 @@ fn print_list(app: &App) {
                     State::Down => "down",
                     State::Unknown => "?",
                 };
-                let numbers: Vec<String> = d.metrics.iter().map(|(k, v)| format!("{k}={v:.0}")).collect();
-                let flag = d.attention().map_or(String::new(), |why| format!("  ! {why}"));
-                println!("  {:<16} {:<5} {:<9} {:<46} {}{flag}", d.name, state, d.kind, numbers.join(" "), d.note);
+                let numbers: Vec<String> = d.metrics.iter().map(|(k, v)| format!("{}={v:.0}", plain(k))).collect();
+                let flag = d.attention().map_or(String::new(), |why| format!("  ! {}", plain(&why)));
+                println!("  {:<16} {:<5} {:<9} {:<46} {}{flag}", plain(&d.name), state, plain(&d.kind), numbers.join(" "), plain(&d.note));
             }
         }
     }
@@ -764,7 +842,7 @@ fn main() {
         }
         app.pump();
         print_list(&app);
-        app.running.stop_all();
+        app.stop_all();
         return;
     }
     if let Err(e) = run_tui(&opts) {
