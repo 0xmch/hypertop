@@ -18,18 +18,30 @@ from one terminal.
 
 ## Install
 
-You need Rust to build it and Python 3 for the bundled sources. It has been developed and
-run on macOS. It should also build on Linux, which is untested so far, and it doesn't run
-on Windows, though it can watch Windows machines over ssh.
+The [releases page](https://github.com/0xmch/hypertop/releases) has builds for macOS (Apple
+Silicon) and Linux (x86-64), each with the bundled sources next to the binary. Those sources
+need Python 3. It doesn't run on Windows, though it can watch Windows machines over ssh.
+
+Unpack one, then link the sources you want:
+
+```
+mkdir -p ~/.config/hypertop/sources
+ln -s "$PWD"/sources/ssh ~/.config/hypertop/sources/ssh   # and any other sources you want
+./hypertop
+```
+
+With [mise](https://mise.jdx.dev), `mise use -g github:0xmch/hypertop` installs it. mise hides
+a release for its first 24 hours unless told otherwise.
+
+To build it yourself you need Rust:
 
 ```
 git clone https://github.com/0xmch/hypertop
 cd hypertop
 cargo build --release
-mkdir -p ~/.config/hypertop/sources
-ln -s "$PWD"/sources/ssh ~/.config/hypertop/sources/ssh   # and any other sources you want
-./target/release/hypertop
 ```
+
+Every source lives in `~/.config/hypertop/sources`, whichever way you installed it.
 
 ## The idea
 
