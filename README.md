@@ -63,6 +63,10 @@ reports back on its own, so one failure doesn't hide among the rest.
 `y`; several take a capital `Y`, because a stray key must not switch off a room. What runs
 is what you confirmed, even if the list changes while you're being asked.
 
+**The list gets the room.** The pane under it is only as tall as it has to be. A section
+whose devices are all one kind and have no numbers for the columns goes side by side, as
+many across as fit without cutting a note, and the arrow keys go down each column in turn.
+
 ## Keys
 
 The footer shows the common ones, `?` shows them all, `q` or Ctrl+C quits.

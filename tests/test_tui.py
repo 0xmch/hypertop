@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import termios
 import time
+import unicodedata
 import unittest
 
 BINARY = os.environ.get("HYPERTOP_BIN") or os.path.join(os.path.dirname(__file__), "..", "target", "release", "hypertop")
@@ -45,6 +46,10 @@ class Screen:
                 if text[at] >= " " and self.y < self.rows and self.x < self.cols:
                     self.cells[self.y][self.x] = (text[at], self.bg)
                     self.x += 1
+                    # A wide character takes the next cell too, and nothing is sent for it.
+                    if unicodedata.east_asian_width(text[at]) in "WF" and self.x < self.cols:
+                        self.cells[self.y][self.x] = (" ", self.bg)
+                        self.x += 1
                 at += 1
                 continue
             token = TOKEN.match(text, at)
@@ -87,6 +92,12 @@ class Screen:
             if any(bg == SELECTED for _, bg in row):
                 return "".join(c for c, _ in row).strip()
         return None
+
+    def highlighted(self):
+        return "".join(c for row in self.cells for c, bg in row if bg == SELECTED).strip()
+
+    def line_with(self, text):
+        return next((i for i, line in enumerate(self.text().split("\n")) if text in line), None)
 
 
 class Tui:
@@ -334,6 +345,114 @@ class Views(Case):
         self.assertIn("device 0000", tui.screen.selected() or "")
         tui.press(DOWN)
         self.assertTrue(tui.until(lambda s: "device 0001" in (s.selected() or ""), 1.0))
+
+
+class Room(Case):
+    """The list gets what the pane doesn't use, and sections with no numbers share lines."""
+
+    def gadgets(self, count, **more):
+        return [
+            {"id": f"g{i}", "name": f"gadget {i:02}", "group": "gadgets", "kind": "thing", "state": "up", "note": f"198.51.100.{i}", **more}
+            for i in range(count)
+        ]
+
+    def show(self, devices, **kwargs):
+        self.describe(devices)
+        tui = Tui(self.sources, **kwargs)
+        self.addCleanup(tui.quit)
+        title = f" {len(devices)} devices "
+        self.assertTrue(tui.until(lambda s: title in s.text() and s.line_with(" overview ") is not None, 3.0), tui.screen.text())
+        tui.read(0.2)
+        return tui
+
+    def test_all_of_it_fits_where_it_would_not_with_a_pane_of_fixed_height(self):
+        machines = [device(i, group="machines", state="up", actions=[]) for i in range(10)]
+        tui = self.show(machines + self.gadgets(12), rows=22, cols=120)
+        for name in [f"device {i:04}" for i in range(10)] + [f"gadget {i:02}" for i in range(12)]:
+            self.assertIn(name, tui.screen.text())
+        tui.press(b"\x1b[F")  # End
+        self.assertTrue(tui.until(lambda s: "device 0009" in s.highlighted(), 1.0), tui.screen.text())
+        self.assertIn("gadget 00", tui.screen.text(), "nothing had to scroll")
+
+    def test_the_pane_is_as_tall_as_it_needs_and_stays_put_as_you_move(self):
+        tui = self.show(self.gadgets(6), rows=30, cols=150)
+        footer = tui.screen.line_with("q or Ctrl+C")
+        for _ in range(6):
+            self.assertEqual(tui.screen.line_with(" overview "), footer - 2, tui.screen.text())
+            tui.press(DOWN)
+            tui.read(0.05)
+
+    def test_a_tall_overview_sets_the_height_for_all_and_is_limited(self):
+        info = {f"field{i:02}": "x" * 60 for i in range(100)}
+        tui = self.show([*self.gadgets(5), {"id": "big", "name": "gadget big", "group": "gadgets", "kind": "thing", "state": "up", "info": info}], rows=30, cols=100)
+        footer = tui.screen.line_with("q or Ctrl+C")
+        top = tui.screen.line_with(" overview ")
+        self.assertEqual(footer - top, (30 - 2) * 2 // 5, "the pane's limit, with its top line")
+        self.assertIsNotNone(tui.screen.line_with("gadget 00"), tui.screen.text())
+
+    def test_a_short_peek_gives_back_what_it_does_not_use(self):
+        peek = [{"label": "look", "run": ["sh", "-c", "echo answer"], "every": 600}]
+        tui = self.show(self.gadgets(3, peeks=peek), rows=30, cols=150)
+        footer = tui.screen.line_with("q or Ctrl+C")
+        tui.press(RIGHT)
+        self.assertTrue(tui.until(lambda s: s.line_with("answer") == footer - 1, 2.0), tui.screen.text())
+        self.assertEqual(tui.screen.line_with(" overview "), footer - 2)
+
+    def test_a_long_peek_stops_at_the_limit_and_keeps_scrolling(self):
+        peek = [{"label": "look", "run": ["sh", "-c", "seq 7000 7099"], "every": 600}]
+        tui = self.show(self.gadgets(3, peeks=peek), rows=30, cols=150)
+        tui.press(RIGHT)
+        self.assertTrue(tui.until(lambda s: "7000" in s.text(), 2.0), tui.screen.text())
+        footer = tui.screen.line_with("q or Ctrl+C")
+        self.assertEqual(footer - tui.screen.line_with(" overview "), (30 - 2) * 2 // 5, tui.screen.text())
+        tui.press(b"J")
+        self.assertTrue(tui.until(lambda s: "7000" not in s.text() and "7003" in s.text(), 1.0), tui.screen.text())
+
+    def test_the_arrows_go_down_each_column_in_turn(self):
+        tui = self.show(self.gadgets(6), rows=30, cols=66)
+        lines = tui.screen.text().split("\n")
+        first = next(line for line in lines if "gadget 00" in line)
+        self.assertIn("gadget 03", first, "three lines of two, like ls")
+        self.assertNotIn("gadget 01", first)
+        self.assertIn("gadget 00", tui.screen.highlighted())
+        self.assertNotIn("gadget 03", tui.screen.highlighted(), "only the cell lights up")
+        for i in range(1, 6):
+            tui.press(DOWN)
+            self.assertTrue(tui.until(lambda s: f"gadget {i:02}" in s.highlighted(), 1.0), tui.screen.text())
+
+    def test_a_click_picks_the_cell_under_it_and_its_start_tags_it(self):
+        tui = self.show(self.gadgets(6), rows=30, cols=150)
+        y = tui.screen.line_with("gadget 05")
+        x = tui.screen.text().split("\n")[y].index("gadget 05")
+        tui.press(f"\x1b[<0;{x + 3};{y + 1}M\x1b[<0;{x + 3};{y + 1}m".encode())
+        self.assertTrue(tui.until(lambda s: "gadget 05" in s.highlighted(), 1.0), tui.screen.text())
+        self.assertNotIn("tagged", tui.screen.text())
+        tui.press(f"\x1b[<0;{x - 3};{y + 1}M\x1b[<0;{x - 3};{y + 1}m".encode())
+        self.assertTrue(tui.until(lambda s: "1 tagged" in s.text(), 1.0), tui.screen.text())
+        self.assertIn("gadget 05", tui.screen.highlighted())
+
+    def test_a_section_stays_in_rows_when_its_columns_would_say_something(self):
+        with_numbers = self.gadgets(3, group="numbers", metrics={"watts": 5})
+        two_kinds = [{**g, "id": f"m{i}", "name": f"mixed {i}", "group": "mixed", "kind": f"kind{i}"} for i, g in enumerate(self.gadgets(2))]
+        tui = self.show(with_numbers + two_kinds, rows=30, cols=150)
+        rows = tui.screen.text().split("\n")
+        self.assertFalse(any("gadget 00" in row and "gadget 01" in row or "mixed 0" in row and "mixed 1" in row for row in rows), tui.screen.text())
+        self.assertIn("POWER", tui.screen.text())
+
+    def test_a_note_is_never_cut_to_make_room_for_a_second_column(self):
+        long_note = "n" * 60
+        tui = self.show(self.gadgets(3, note=long_note), rows=30, cols=100)
+        rows = tui.screen.text().split("\n")
+        self.assertFalse(any("gadget 00" in row and "gadget 01" in row for row in rows), tui.screen.text())
+
+    def test_a_flowed_section_loses_no_facts_and_drops_the_column_names(self):
+        tui = self.show(self.gadgets(4), rows=30, cols=150)
+        self.assertNotIn("NAME", tui.screen.text(), "no row has those columns")
+        self.assertIn("kind thing", tui.screen.text())
+
+    def test_a_very_small_terminal_still_shows_some_of_the_list(self):
+        tui = self.show(self.gadgets(6), rows=8, cols=40)
+        self.assertIn("gadget 00", tui.screen.text())
 
 
 class Actions(Case):

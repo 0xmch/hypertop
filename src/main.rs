@@ -168,6 +168,7 @@ pub struct App {
     pub rows: Vec<Row>,
     /// Where the rows landed on screen, for the mouse.
     pub list_area: ratatui::layout::Rect,
+    pub list_lines: Vec<ui::ListLine>,
     pub sources: usize,
     pub dir: PathBuf,
     tty_request: Option<Vec<String>>,
@@ -205,6 +206,7 @@ impl App {
             behind: false,
             rows: Vec::new(),
             list_area: Default::default(),
+            list_lines: Vec::new(),
             sources,
             dir: opts.dir.clone(),
             tty_request: None,
@@ -707,10 +709,11 @@ impl App {
             MouseEventKind::ScrollUp if matches!(self.mode, Mode::Normal) => self.move_selection(-1),
             MouseEventKind::ScrollDown if matches!(self.mode, Mode::Normal) => self.move_selection(1),
             MouseEventKind::Down(MouseButton::Left) if inside && matches!(self.mode, Mode::Normal) => {
-                let row = self.top + (event.row - area.y) as usize;
+                let line = self.list_lines.get(self.top + (event.row - area.y) as usize);
+                let Some((row, into)) = line.and_then(|l| l.at((event.column - area.x) as usize)) else { return };
                 if let Some(Row::Device(key)) = self.rows.get(row).cloned() {
                     // The first columns are the tag; elsewhere a click selects.
-                    if event.column <= area.x + 2 {
+                    if into <= 2 {
                         if let Some(device) = self.model.get_mut(&key) {
                             device.tagged = !device.tagged;
                         }
