@@ -1,26 +1,14 @@
 name: release
 
-# A version tag builds hypertop for each platform and publishes the builds, with the
-# bundled sources next to the binary, as a GitHub release.
+# A version tag builds hypertop for each platform, and only when every build and its
+# tests pass, publishes them with the bundled sources next to the binary as a release.
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-
 jobs:
-  create:
-    runs-on: ubuntu-latest
-    steps:
-      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-
   build:
-    needs: create
     strategy:
-      fail-fast: false
       matrix:
         include:
           - { runner: macos-latest, target: aarch64-apple-darwin }
@@ -34,9 +22,8 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: Upload the build
+      - name: Pack the build
         env:
-          GH_TOKEN: ${{ github.token }}
           TARGET: ${{ matrix.target }}
         run: |
           dir="hypertop-$GITHUB_REF_NAME-$TARGET"
@@ -44,4 +31,20 @@ jobs:
           cp "target/$TARGET/release/hypertop" LICENSE README.md "$dir/"
           cp -R sources "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
-          gh release upload "$GITHUB_REF_NAME" "$dir.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: hypertop-*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes hypertop-*.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}

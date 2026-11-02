@@ -202,7 +202,12 @@ pub fn run_collecting(argv: &[String], timeout: Duration, stop: &Stop, mut on_ou
             on_output(&chunk);
         }
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status.code().unwrap_or(-1)),
+            // Stop can kill it between two looks, so a death by signal may be ours.
+            Ok(Some(status)) => match status.code() {
+                Some(code) => break Ok(code),
+                None if stop.0 .0.load(SeqCst) => break Err("stopped".to_string()),
+                None => break Ok(-1),
+            },
             Err(e) => break Err(e.to_string()),
             Ok(None) => {}
         }
