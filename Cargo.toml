@@ -1,6 +1,6 @@
 [package]
 name = "hypertop"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Peek at and act on many devices at once, from one terminal"
 license = "MIT"
