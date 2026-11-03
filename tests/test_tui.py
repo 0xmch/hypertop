@@ -8,6 +8,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -266,6 +267,38 @@ class Responsiveness(Case):
         tui.read(3)
         self.assertTrue(tui.quit())
         self.assertLess(tui.cpu_seconds(), 0.3)
+
+
+class Here(Case):
+    def show(self, devices):
+        self.describe(devices)
+        tui = Tui(self.sources)
+        self.addCleanup(tui.quit)
+        self.assertTrue(tui.until(lambda s: "(here)" in s.text() or "plain" in s.text()), tui.screen.text())
+        return tui
+
+    def test_the_title_says_which_machine_this_is(self):
+        tui = self.show([device(0, name="plain")])
+        self.assertIn(f"hypertop @ {socket.gethostname().split('.')[0]}", tui.screen.text().splitlines()[0])
+        self.assertNotIn("(here)", tui.screen.text())
+
+    def test_the_row_of_this_machine_says_so_and_a_long_name_gives_way(self):
+        tui = self.show([device(0, name="a-very-long-machine-name", here=True), device(1, name="plain")])
+        rows = tui.screen.text().splitlines()
+        self.assertIn("(here)", rows[tui.screen.line_with("a-very-l")])
+        self.assertNotIn("(here)", rows[tui.screen.line_with("plain")])
+
+    def test_the_menu_says_so_before_anything_runs_here(self):
+        tui = self.show([device(0, name="box", here=True)])
+        tui.press(b"\r")
+        self.assertTrue(tui.until(lambda s: "act on box (here)" in s.text()), tui.screen.text())
+        tui.press(b"\x1b")
+
+    def test_the_list_says_so_too(self):
+        self.describe([device(0, name="box", here=True), device(1, name="plain")])
+        out = subprocess.run([BINARY, "--list", "--sources", self.sources, "--wait", "1"], capture_output=True, text=True, check=False).stdout
+        self.assertEqual(out.splitlines()[0], f"hypertop @ {socket.gethostname().split('.')[0]}")
+        self.assertIn("box (here)", out)
 
 
 class Peeks(Case):

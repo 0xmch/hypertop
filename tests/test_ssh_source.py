@@ -37,6 +37,28 @@ class Wake(unittest.TestCase):
         self.assertFalse(source.is_local_network("example.com"))
 
 
+class Here(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, source, "own_mac", source.own_mac)
+        source.own_mac = lambda: "aa:bb:cc:dd:ee:ff"
+
+    def test_only_this_machines_address_is_here(self):
+        self.assertTrue(source.is_here("aa:bb:cc:dd:ee:ff"))
+        self.assertFalse(source.is_here("aa:bb:cc:dd:ee:00"))
+        self.assertFalse(source.is_here(None))
+
+    def test_not_knowing_ones_own_address_makes_nothing_here(self):
+        source.own_mac = lambda: None
+        self.assertFalse(source.is_here(None))
+        self.assertFalse(source.is_here("aa:bb:cc:dd:ee:ff"))
+
+    def test_an_address_is_found_in_what_each_system_prints(self):
+        self.assertEqual(source.mac_in("Ethernet Address: AA:BB:CC:DD:EE:FF (Device: en0)\n"), "aa:bb:cc:dd:ee:ff")
+        self.assertEqual(source.mac_in("AA-BB-CC-DD-EE-FF\r\n"), "aa:bb:cc:dd:ee:ff")
+        self.assertIsNone(source.mac_in("02:00:00:00:00:00"))
+        self.assertIsNone(source.mac_in(""))
+
+
 class WhileOff(unittest.TestCase):
     def host(self, hostname):
         host = source.Host.__new__(source.Host)

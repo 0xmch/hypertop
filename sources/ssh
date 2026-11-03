@@ -8,8 +8,10 @@ One running sampler costs far less than a new connection and a new interpreter
 every few seconds, and it ends by itself when the connection goes.
 
 Everything goes through ssh and its config, this machine included if it's listed, so
-that an alias means here what it means everywhere else. Aliases listed in
-~/.config/hypertop/ssh-skip (one per line) are left out.
+that an alias means here what it means everywhere else. It's the one marked "here": the
+one whose MAC address is this machine's. Host names can repeat, and through a tunnel any
+machine can look local. Aliases listed in ~/.config/hypertop/ssh-skip (one per line) are
+left out.
 
 While a machine is up it is asked for its MAC address, which is remembered in
 ~/.cache/hypertop/ssh-hosts.json, so that it can still be woken once it is off and
@@ -203,6 +205,36 @@ def usable_mac(text):
     return None if mac in ("00:00:00:00:00:00", "02:00:00:00:00:00") else mac
 
 
+# Prints the address of the interface a machine reaches the network through.
+MAC_COMMANDS = {
+    "Linux": "i=$(ip route show default 2>/dev/null | awk '{print $5; exit}'); cat /sys/class/net/$i/address",
+    # networksetup: ifconfig can show a placeholder instead of the real address.
+    "macOS": "i=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}'); networksetup -getmacaddress $i",
+}
+
+
+def mac_in(text):
+    found = re.search(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", text)
+    return usable_mac(found.group(0)) if found else None
+
+
+def own_mac():
+    """This machine's address, found the way the others are asked for theirs."""
+    system = os.uname().sysname
+    command = MAC_COMMANDS.get({"Darwin": "macOS"}.get(system, system))
+    if not command:
+        return None
+    try:
+        r = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL, errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return mac_in(r.stdout)
+
+
+def is_here(mac):
+    return mac is not None and mac == own_mac()
+
+
 def wake(mac):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -330,19 +362,14 @@ class Host:
 
     def mac_address(self):
         """The address of the interface this machine reaches the network through."""
-        unix = {
-            "Linux": "i=$(ip route show default 2>/dev/null | awk '{print $5; exit}'); cat /sys/class/net/$i/address",
-            # networksetup: ifconfig can show a placeholder instead of the real address.
-            "macOS": "i=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}'); networksetup -getmacaddress $i",
-        }.get(self.system)
+        unix = MAC_COMMANDS.get(self.system)
         if unix:
             command = "sh -c " + shlex.quote(unix)
         elif self.system == "Windows":
             command = WINDOWS_PS + '"(Get-NetAdapter -InterfaceIndex (Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1).ifIndex).MacAddress"'
         else:
             return None
-        found = re.search(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", self.ask(command).stdout)
-        return usable_mac(found.group(0)) if found else None
+        return mac_in(self.ask(command).stdout)
 
     def has(self, tool):
         probe = f"where {tool}" if self.system == "Windows" else f"command -v {tool}"
@@ -470,7 +497,8 @@ class Host:
 
 def watch(host):
     known = load_remembered().get(host.alias, {})
-    emit(id=host.alias, name=host.alias, group="computers", kind=known.get("system", "?"), state="unknown", info=host.info())
+    emit(id=host.alias, name=host.alias, group="computers", kind=known.get("system", "?"), state="unknown", info=host.info(),
+         here=is_here(known.get("mac")))
     was_off = False
     trouble = None
     while True:
@@ -481,6 +509,7 @@ def watch(host):
             mac = host.mac_address()
             if mac:
                 remember(host.alias, mac=mac)
+                emit(id=host.alias, here=is_here(mac))
             # A sampler that keeps failing stays shown as failing, until a sample says otherwise.
             emit(id=host.alias, kind=host.system, note=version, state="unknown" if trouble else "up", alert=trouble,
                  peeks=host.peeks(), actions=host.actions())

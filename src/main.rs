@@ -142,6 +142,8 @@ struct ActivePeek {
 }
 
 pub struct App {
+    /// The machine this is running on, as shown in the title. Empty if it won't say.
+    pub host: String,
     pub model: Model,
     pub selected: Option<String>,
     /// You have moved. Until then the first row stays selected, in whatever order
@@ -186,6 +188,7 @@ impl App {
         let sources = found.len();
         let wakes = found.into_iter().map(|path| run::spawn_source(path, tx.clone(), running.clone())).collect();
         App {
+            host: host_name(),
             model: Model::default(),
             selected: None,
             chosen: false,
@@ -427,7 +430,7 @@ impl App {
             .iter()
             .filter_map(|key| {
                 let device = self.model.get(key)?;
-                Some((device.name.clone(), device.actions.iter().find(|a| a.id == id)?.clone()))
+                Some((device.label(), device.actions.iter().find(|a| a.id == id)?.clone()))
             })
             .collect();
         Some(Plan {
@@ -803,7 +806,21 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
     result
 }
 
+/// This machine's name, without its domain.
+fn host_name() -> String {
+    let mut name = [0u8; 256];
+    // One byte less than there is: a name that gets cut needn't come with its end.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len() - 1) } != 0 {
+        return String::new();
+    }
+    let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+    run::clean(&String::from_utf8_lossy(&name[..end])).split('.').next().unwrap_or_default().to_string()
+}
+
 fn print_list(app: &App) {
+    if !app.host.is_empty() {
+        println!("hypertop @ {}", app.host);
+    }
     if app.sources == 0 {
         println!("no sources in {}", app.dir.display());
     }
@@ -822,7 +839,7 @@ fn print_list(app: &App) {
                 };
                 let numbers: Vec<String> = d.metrics.iter().map(|(k, v)| format!("{}={v:.0}", plain(k))).collect();
                 let flag = d.attention().map_or(String::new(), |why| format!("  ! {}", plain(&why)));
-                println!("  {:<16} {:<5} {:<9} {:<46} {}{flag}", plain(&d.name), state, plain(&d.kind), numbers.join(" "), plain(&d.note));
+                println!("  {:<16} {:<5} {:<9} {:<46} {}{flag}", plain(&d.label()), state, plain(&d.kind), numbers.join(" "), plain(&d.note));
             }
         }
     }

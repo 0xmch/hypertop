@@ -13,6 +13,9 @@ const HISTORY: usize = 12;
 const LIMITS: [(&str, f64, &str); 4] =
     [("disk", 90.0, "disk"), ("mem", 95.0, "memory"), ("temp", 85.0, "temperature"), ("gputemp", 85.0, "GPU temperature")];
 
+/// How the machine hypertop runs on is marked, after its name.
+pub const HERE: &str = " (here)";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     Up,
@@ -47,6 +50,8 @@ pub struct Device {
     pub name: String,
     pub group: String,
     pub kind: String,
+    /// The machine hypertop itself is running on, if its source can tell.
+    pub here: bool,
     pub state: State,
     pub note: String,
     pub alert: Option<String>,
@@ -81,6 +86,7 @@ impl Device {
             name: id.to_string(),
             group: source.to_string(),
             kind: String::new(),
+            here: false,
             state: State::Unknown,
             note: String::new(),
             alert: None,
@@ -105,6 +111,9 @@ impl Device {
         }
         if let Some(text) = line["kind"].as_str() {
             self.kind = text.to_string();
+        }
+        if let Some(here) = line["here"].as_bool() {
+            self.here = here;
         }
         if let Some(text) = line["state"].as_str() {
             let state = parse_state(text);
@@ -168,6 +177,16 @@ impl Device {
                     })
                 })
                 .collect();
+        }
+    }
+
+    /// Its name, saying so if this is the machine hypertop runs on: worth knowing
+    /// before you reboot it.
+    pub fn label(&self) -> String {
+        if self.here {
+            format!("{}{HERE}", self.name)
+        } else {
+            self.name.clone()
         }
     }
 
@@ -341,6 +360,18 @@ mod tests {
         assert_eq!(d.group, "g1");
         assert_eq!(d.metrics["cpu"], 20.0);
         assert_eq!(d.cpu_history, VecDeque::from([10.0, 20.0]));
+    }
+
+    #[test]
+    fn a_source_says_which_device_is_this_machine() {
+        let mut m = model();
+        assert_eq!(m.get("s/b").unwrap().label(), m.get("s/b").unwrap().name);
+        m.line("s", &json!({"id": "b", "here": true}));
+        m.line("s", &json!({"id": "b", "metrics": {"cpu": 20.0}}));
+        let name = m.get("s/b").unwrap().name.clone();
+        assert_eq!(m.get("s/b").unwrap().label(), format!("{name} (here)"));
+        m.line("s", &json!({"id": "b", "here": false}));
+        assert_eq!(m.get("s/b").unwrap().label(), name);
     }
 
     #[test]

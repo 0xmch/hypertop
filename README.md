@@ -71,6 +71,9 @@ many across as fit without cutting a note, and the arrow keys go down each colum
 
 The footer shows the common ones, `?` shows them all, `q` or Ctrl+C quits.
 
+The title says which machine hypertop is running on, and if that machine is in the list,
+its row says `(here)`, as do the menu and the question before anything runs on it.
+
 `hypertop --list` prints the same picture without the interface.
 
 ## Writing a source
@@ -89,6 +92,7 @@ print(json.dumps({
     "name": "Printer",
     "group": "office",               # the section it appears under
     "kind": "printer",
+    "here": False,                   # True for the machine hypertop is running on
     "state": "up",                   # up, idle, down, or anything else for unknown
     "note": "paper low",             # free text at the end of the row
     "alert": None,                   # text here marks it as needing attention
@@ -132,7 +136,7 @@ Link the ones you want into `~/.config/hypertop/sources/`.
   it stays out of a game's way. Temperature comes from the sensors on Linux and from the
   die sensors on a Mac, with no sudo, if Homebrew's Python is there.
   Everything goes through `ssh`, so `ProxyJump` and the like work, and this machine needs
-  its own ssh server if it's listed. While a machine is up it is asked for its MAC address,
+  its own ssh server if it's listed; it's recognized by its MAC address. While a machine is up it is asked for its MAC address,
   which is remembered so that it can be woken with a magic packet once it is off. A machine
   shown as off is one ssh can't reach: it may well be on, with ssh closed.
 - **`sources/lan`**: whatever answers a ping on this machine's subnet. It only ever looks at

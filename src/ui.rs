@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::model::{Device, Row, State};
+use crate::model::{Device, Row, State, HERE};
 use crate::{App, Job, Mode};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -151,13 +151,19 @@ fn device_of<'a>(app: &'a App, row: &Row) -> Option<&'a Device> {
 }
 
 /// How a device starts, wherever it's drawn: its tag, its mark and its name.
-fn device_start(device: &Device, name_width: usize) -> [Span<'static>; 4] {
+fn device_start(device: &Device, name_width: usize) -> [Span<'static>; 5] {
     let name_style = if device.state == State::Down { DIM } else { BOLD };
+    // A long name gives way, not the mark.
+    let here = if device.here { HERE } else { "" };
+    let room = name_width.saturating_sub(here.chars().count());
+    let name = truncate(&device.name, room);
+    let rest = " ".repeat(room.saturating_sub(name.chars().count()));
     [
         Span::styled(if device.tagged { "✓ " } else { "  " }, Style::new().fg(Color::Yellow)),
         state_mark(device.state),
         Span::raw(" "),
-        Span::styled(pad(&device.name, name_width), name_style),
+        Span::styled(name, name_style),
+        Span::styled(format!("{here}{rest}"), Style::new().fg(Color::Cyan)),
     ]
 }
 
@@ -227,7 +233,7 @@ fn flow_shape<'a>(devices: impl Iterator<Item = &'a Device>, width: usize) -> Op
             return None;
         }
         count += 1;
-        name = name.max(device.name.chars().count());
+        name = name.max(device.label().chars().count());
         note = note.max(device_note(device).0.chars().count());
     }
     let name = name.min(FLOW_NAME_WIDTH);
@@ -328,8 +334,9 @@ fn detail_height(app: &App, width: usize, available: u16) -> u16 {
 fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     let (total, up, down, attention) = app.model.counts();
     let bar = Style::new().bg(BAR);
+    let name = if app.host.is_empty() { " hypertop ".to_string() } else { format!(" hypertop @ {} ", app.host) };
     let mut spans = vec![
-        Span::styled(" hypertop ", bar.fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(name, bar.fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" {total} devices  {up} up  {down} off"), bar),
     ];
     if attention > 0 {
@@ -497,7 +504,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Block::new().borders(Borders::TOP).border_style(DIM), area);
         return;
     };
-    let mut tabs = vec![Span::styled(format!(" {} ", device.name), BOLD)];
+    let mut tabs = vec![Span::styled(format!(" {} ", device.label()), BOLD)];
     let mut labels = vec!["overview".to_string()];
     labels.extend(device.peeks.iter().map(|p| p.label.clone()));
     for (i, label) in labels.iter().enumerate() {
@@ -574,7 +581,7 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
     let Mode::Menu { items, at, targets } = &app.mode else { return };
     let total = targets.len();
     let who = match targets.as_slice() {
-        [key] => app.model.get(key).map_or(key.clone(), |d| d.name.clone()),
+        [key] => app.model.get(key).map_or(key.clone(), Device::label),
         _ => format!("{total} devices"),
     };
     let inner = popup(frame, area, 54, items.len() as u16 + 4, &format!("act on {who}"));
