@@ -3,6 +3,8 @@
 `top`, for every device you own: peek at many at once and act on any number of them,
 from one terminal.
 
+The write-up: [A top for every device I own](https://0xmch.xyz/posts/hypertop/).
+
 ```
  hypertop  14 devices  9 up  3 off
     NAME             KIND                     CPU   MEM  DISK   GPU  TEMP   POWER     UP NOTE
